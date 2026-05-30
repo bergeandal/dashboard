@@ -12,6 +12,7 @@ const CATS = {
   home:     { label: "Home",     dot: "#6f9e6a", soft: "rgba(111,158,106,0.12)" },
   social:   { label: "Social",   dot: "#b07ec2", soft: "rgba(176,126,194,0.12)" },
   birthday: { label: "Birthday", dot: "#d96a8a", soft: "rgba(217,106,138,0.14)" },
+  event:    { label: "Event",    dot: "#d4a056", soft: "rgba(212,160,86,0.14)" },
 };
 
 const stripBursdag = (s) => s.replace(/\s*sin\s+bursdag\s*$/i, "").trim();
@@ -163,14 +164,24 @@ export default function App() {
         if (seen.has(k)) return false;
         seen.add(k); return true;
       });
-    const all = [...month, ...bdays]
+    // Events from the calendar, dedup'd. Excluded from the imminent box later
+    // since they already appear in the Today timeline with a time.
+    const events = calendarTasks
+      .filter(t => t.cat === "event")
+      .map(t => ({ id: t.id, date: t.date, title: t.title, cat: "event", start: t.start }))
+      .filter(e => {
+        const k = `${e.date}|${e.title}`;
+        if (seen.has(k)) return false;
+        seen.add(k); return true;
+      });
+    const all = [...month, ...bdays, ...events]
       .filter(e => e.date >= todayStr && e.date <= cutoffStr)
       .sort((a, b) => a.date.localeCompare(b.date));
     return {
-      imminent: all.filter(e => e.date === todayStr || e.date === tomorrowStr),
+      imminent: all.filter(e => e.cat !== "event" && (e.date === todayStr || e.date === tomorrowStr)),
       later: all.filter(e => e.date > tomorrowStr),
     };
-  }, [month, birthdays, today]);
+  }, [month, birthdays, calendarTasks, today]);
 
   if (status === "loading") {
     return <div style={S.shell}><style>{globalCss}</style><div style={S.loading}>Connecting to Command Deck…</div></div>;
