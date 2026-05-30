@@ -6,7 +6,7 @@ const required = (name: string): string => {
   return v;
 };
 
-export type Category = "work" | "training" | "social" | "home";
+export type Category = "work" | "training" | "social" | "home" | "birthday";
 
 export const config = {
   port: Number(process.env.PORT ?? 3001),
@@ -18,5 +18,6 @@ export const config = {
     work: required("ICS_WORK"),
     social: required("ICS_SOCIAL"),
     home: required("ICS_HOME"),
-  } satisfies Record<Category, string>,
+  } as Record<Exclude<Category, "birthday">, string>,
+  birthdaysFile: process.env.BIRTHDAYS_FILE ?? "./birthdays.ics",
 };

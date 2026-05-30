@@ -27,6 +27,7 @@ RUN npm run build
 FROM node:22-alpine
 WORKDIR /app
 COPY server/package.json ./
+COPY server/birthdays.ics ./birthdays.ics
 COPY --from=server-deps /deps/node_modules ./node_modules
 COPY --from=server-build /build/dist ./dist
 COPY --from=frontend /frontend/dist ./public

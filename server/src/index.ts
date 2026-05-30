@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config, type Category } from "./config.js";
-import { fetchAllTasks } from "./calendar/fetch.js";
+import { fetchAllTasks, fetchBirthdays } from "./calendar/fetch.js";
 import { getWeather } from "./weather/yr.js";
 import { dbo } from "./db.js";
 
@@ -44,13 +44,16 @@ app.get("/api/data", async (req) => {
   const days = Math.min(Math.max(Number(q.days ?? 60), 7), 120);
   const end = new Date(+start + days * 24 * 3600 * 1000);
 
-  const [tasks, weather] = await Promise.all([
+  const birthdaysEnd = new Date(+start + 365 * 24 * 3600 * 1000);
+  const [tasks, birthdays, weather] = await Promise.all([
     fetchAllTasks(start, end),
+    fetchBirthdays(start, birthdaysEnd),
     getWeather().catch((e) => { app.log.error(e); return null; }),
   ]);
 
   return {
     tasks,
+    birthdays,
     localTasks: dbo.listLocalTasks(),
     doneIds: dbo.listDoneIds(),
     month: dbo.listMonth(),

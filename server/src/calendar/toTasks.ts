@@ -32,13 +32,12 @@ const isAllDay = (ev: any): boolean => {
   return ev.datetype === "date";
 };
 
-export async function fetchCalendarAsTasks(
-  url: string,
+function eventsToTasks(
+  data: any,
   cat: Category,
   windowStart: Date,
   windowEnd: Date,
-): Promise<Task[]> {
-  const data = await ical.async.fromURL(url);
+): Task[] {
   const out: Task[] = [];
 
   for (const key of Object.keys(data)) {
@@ -90,4 +89,24 @@ export async function fetchCalendarAsTasks(
   }
 
   return out;
+}
+
+export async function fetchCalendarAsTasks(
+  url: string,
+  cat: Category,
+  windowStart: Date,
+  windowEnd: Date,
+): Promise<Task[]> {
+  const data = await ical.async.fromURL(url);
+  return eventsToTasks(data, cat, windowStart, windowEnd);
+}
+
+export async function fetchCalendarFromFile(
+  path: string,
+  cat: Category,
+  windowStart: Date,
+  windowEnd: Date,
+): Promise<Task[]> {
+  const data = await ical.async.parseFile(path);
+  return eventsToTasks(data, cat, windowStart, windowEnd);
 }

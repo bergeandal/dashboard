@@ -11,7 +11,10 @@ const CATS = {
   training: { label: "Training", dot: "#4f7fc2", soft: "rgba(79,127,194,0.12)" },
   home:     { label: "Home",     dot: "#6f9e6a", soft: "rgba(111,158,106,0.12)" },
   social:   { label: "Social",   dot: "#b07ec2", soft: "rgba(176,126,194,0.12)" },
+  birthday: { label: "Birthday", dot: "#d96a8a", soft: "rgba(217,106,138,0.14)" },
 };
+
+const stripBursdag = (s) => s.replace(/\s*sin\s+bursdag\s*$/i, "").trim();
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
@@ -31,6 +34,7 @@ export default function App() {
   const today = useMemo(() => { const d = new Date(); d.setHours(0,0,0,0); return d; }, []);
 
   const [calendarTasks, setCalendarTasks] = useState([]);
+  const [birthdays, setBirthdays] = useState([]);
   const [weather, setWeather] = useState(null);
   const [localTasks, setLocalTasks] = useState([]);
   const [doneIds, setDoneIds] = useState([]);
@@ -48,6 +52,7 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCalendarTasks(data.tasks || []);
+      setBirthdays(data.birthdays || []);
       setLocalTasks(data.localTasks || []);
       setDoneIds(data.doneIds || []);
       setMonth(data.month || []);
@@ -94,9 +99,9 @@ export default function App() {
 
   const doneSet = useMemo(() => new Set(doneIds), [doneIds]);
   const allTasks = useMemo(() => {
-    const merged = [...calendarTasks, ...localTasks].map((t) => ({ ...t, done: doneSet.has(t.id) }));
+    const merged = [...calendarTasks, ...birthdays, ...localTasks].map((t) => ({ ...t, done: doneSet.has(t.id) }));
     return merged.sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
-  }, [calendarTasks, localTasks, doneSet]);
+  }, [calendarTasks, birthdays, localTasks, doneSet]);
 
   const toggle = (id) => {
     const wasDone = doneSet.has(id);
@@ -145,6 +150,20 @@ export default function App() {
       .filter((t) => t.cat === "training" && !t.done && t.date >= todayStr)
       .sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start))[0] || null;
   }, [allTasks, today]);
+
+  const monthEntries = useMemo(() => {
+    const todayStr = iso(today);
+    const seen = new Set(month.map(m => `${m.date}|${m.title}`));
+    const bdays = birthdays
+      .filter(t => t.date >= todayStr)
+      .map(t => ({ id: t.id, date: t.date, title: stripBursdag(t.title), cat: "birthday" }))
+      .filter(b => {
+        const k = `${b.date}|${b.title}`;
+        if (seen.has(k)) return false;
+        seen.add(k); return true;
+      });
+    return [...month, ...bdays];
+  }, [month, birthdays, today]);
 
   if (status === "loading") {
     return <div style={S.shell}><style>{globalCss}</style><div style={S.loading}>Connecting to Command Deck…</div></div>;
@@ -290,7 +309,7 @@ export default function App() {
 
       <section style={S.card} className="cd-card">
         <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>birthdays · invitations · key dates</span></div>
-        <MonthList month={month} onAdd={addMonth} onRemove={removeMonth} />
+        <MonthList month={monthEntries} onAdd={addMonth} onRemove={removeMonth} />
       </section>
 
       <footer style={S.footer}>
@@ -385,7 +404,9 @@ function MonthList({ month, onAdd, onRemove }) {
               </div>
               <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
               <span style={S.monthTitle}>{m.title}</span>
-              <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
+              {m.id.startsWith("m:") ? (
+                <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
+              ) : <span />}
             </div>
           );
         })}
