@@ -1,0 +1,20 @@
+app = "command-deck-berge"
+primary_region = "arn"
+
+[build]
+
+[env]
+  PORT = "8080"
+  LAT = "60.3913"
+  LON = "5.3221"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
