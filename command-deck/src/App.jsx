@@ -151,18 +151,25 @@ export default function App() {
       .sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start))[0] || null;
   }, [allTasks, today]);
 
-  const monthEntries = useMemo(() => {
+  const { imminent, later } = useMemo(() => {
     const todayStr = iso(today);
+    const tomorrowStr = iso(addDays(today, 1));
+    const cutoffStr = iso(addDays(today, 30));
     const seen = new Set(month.map(m => `${m.date}|${m.title}`));
     const bdays = birthdays
-      .filter(t => t.date >= todayStr)
       .map(t => ({ id: t.id, date: t.date, title: stripBursdag(t.title), cat: "birthday" }))
       .filter(b => {
         const k = `${b.date}|${b.title}`;
         if (seen.has(k)) return false;
         seen.add(k); return true;
       });
-    return [...month, ...bdays];
+    const all = [...month, ...bdays]
+      .filter(e => e.date >= todayStr && e.date <= cutoffStr)
+      .sort((a, b) => a.date.localeCompare(b.date));
+    return {
+      imminent: all.filter(e => e.date === todayStr || e.date === tomorrowStr),
+      later: all.filter(e => e.date > tomorrowStr),
+    };
   }, [month, birthdays, today]);
 
   if (status === "loading") {
@@ -308,8 +315,8 @@ export default function App() {
       </section>
 
       <section style={S.card} className="cd-card">
-        <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>birthdays · invitations · key dates</span></div>
-        <MonthList month={monthEntries} onAdd={addMonth} onRemove={removeMonth} />
+        <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>next 30 days</span></div>
+        <MonthList imminent={imminent} later={later} today={today} onAdd={addMonth} onRemove={removeMonth} />
       </section>
 
       <footer style={S.footer}>
@@ -384,17 +391,34 @@ function WeatherDetail({ day }) {
   );
 }
 
-function MonthList({ month, onAdd, onRemove }) {
+function MonthList({ imminent, later, today, onAdd, onRemove }) {
   const [date, setDate] = useState("");
   const [title, setTitle] = useState("");
   const [cat, setCat] = useState("social");
-  const sorted = [...month].filter(m=>m.date).sort((a,b)=>a.date.localeCompare(b.date));
+  const todayStr = (d => { const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),da=String(d.getDate()).padStart(2,"0"); return `${y}-${m}-${da}`;})(today);
 
   return (
     <div>
+      {imminent.length > 0 && (
+        <div style={S.imminentBox}>
+          {imminent.map((m) => (
+            <div key={m.id} style={S.imminentRow}>
+              <span style={S.imminentWhen}>{m.date === todayStr ? "Today" : "Tomorrow"}</span>
+              <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
+              <span style={S.imminentTitle}>{m.title}</span>
+              {m.id.startsWith("m:") && (
+                <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       <div style={S.monthList}>
-        {sorted.length === 0 && <div style={S.empty}>Add birthdays, invitations & key dates here.</div>}
-        {sorted.map((m) => {
+        {imminent.length === 0 && later.length === 0 && (
+          <div style={S.empty}>Nothing in the next 30 days. Add something below.</div>
+        )}
+        {later.map((m) => {
           const d = new Date(m.date + "T00:00:00");
           return (
             <div key={m.id} style={S.monthItem} className="cd-row">
@@ -411,6 +435,7 @@ function MonthList({ month, onAdd, onRemove }) {
           );
         })}
       </div>
+
       <div style={S.monthAdd}>
         <input type="date" value={date} onChange={(e)=>setDate(e.target.value)} style={{ ...S.input, flex:"0 0 auto" }} />
         <input placeholder="e.g. Mom's birthday" value={title} onChange={(e)=>setTitle(e.target.value)} style={S.input} />
@@ -526,6 +551,10 @@ const S = {
   weekDots: { display: "flex", justifyContent: "center", gap: 3, minHeight: 8, flexWrap: "wrap" },
   weekDot: { width: 7, height: 7, borderRadius: "50%" },
   weekCount: { fontSize: 11, color: muted, marginTop: 8, fontVariantNumeric: "tabular-nums" },
+  imminentBox: { background: "#fbf3ec", border: "1px solid #ebd2bf", borderRadius: 14, padding: "10px 14px", marginBottom: 14, display: "flex", flexDirection: "column", gap: 6 },
+  imminentRow: { display: "grid", gridTemplateColumns: "82px 10px 1fr 24px", gap: 12, alignItems: "center" },
+  imminentWhen: { fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 700, color: "#c2724f", letterSpacing: "0.02em" },
+  imminentTitle: { fontSize: 14.5, fontWeight: 600, color: ink },
   monthList: { display: "flex", flexDirection: "column", gap: 2, marginBottom: 14 },
   monthItem: { display: "grid", gridTemplateColumns: "46px 10px 1fr 24px", gap: 12, alignItems: "center", padding: "9px 4px", borderBottom: `1px solid ${line}` },
   monthDate: { textAlign: "center" },
