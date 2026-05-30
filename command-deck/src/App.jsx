@@ -20,13 +20,6 @@ const iso = (d) => {
   const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,"0"), day = String(d.getDate()).padStart(2,"0");
   return `${y}-${m}-${day}`;
 };
-const startOfWeek = (d) => {
-  const x = new Date(d);
-  const day = (x.getDay() + 6) % 7;
-  x.setDate(x.getDate() - day);
-  x.setHours(0, 0, 0, 0);
-  return x;
-};
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
 
 const REFRESH_MS = 5 * 60 * 1000;
@@ -38,7 +31,6 @@ const saveLocal = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); 
 
 export default function App() {
   const today = useMemo(() => { const d = new Date(); d.setHours(0,0,0,0); return d; }, []);
-  const monday = useMemo(() => startOfWeek(today), [today]);
 
   const [calendarTasks, setCalendarTasks] = useState([]);
   const [weather, setWeather] = useState(null);
@@ -46,13 +38,14 @@ export default function App() {
   const [doneIds, setDoneIds] = useState(() => loadLocal("cd.doneIds", []));
   const [month, setMonth] = useState(() => loadLocal("cd.month", []));
   const [selectedDate, setSelectedDate] = useState(iso(today));
+  const [openWeatherDate, setOpenWeatherDate] = useState(null);
   const [status, setStatus] = useState("loading"); // loading | ready | error
   const [error, setError] = useState("");
   const [adding, setAdding] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
-      const start = iso(monday);
+      const start = iso(today);
       const res = await fetch(`/api/data?start=${start}&days=60`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -64,13 +57,18 @@ export default function App() {
       setStatus((s) => s === "ready" ? "ready" : "error");
       setError(String(e.message || e));
     }
-  }, [monday]);
+  }, [today]);
 
   useEffect(() => {
     fetchData();
     const id = setInterval(fetchData, REFRESH_MS);
     return () => clearInterval(id);
   }, [fetchData]);
+
+  useEffect(() => {
+    if (!weather?.days?.length || openWeatherDate) return;
+    setOpenWeatherDate(weather.days[0].date);
+  }, [weather, openWeatherDate]);
 
   useEffect(() => saveLocal("cd.localTasks", localTasks), [localTasks]);
   useEffect(() => saveLocal("cd.doneIds", doneIds), [doneIds]);
@@ -195,35 +193,44 @@ export default function App() {
               <span style={S.cardSub}>{weather ? "Live from YR.no" : "Loading…"}</span>
             </div>
             {weather?.days?.length ? (
-              <div style={S.wxRow}>
-                {weather.days.map((w) => (
-                  <div key={w.date} style={S.wxDay}>
-                    <div style={S.wxName}>{w.d}</div>
-                    <div style={S.wxIcon}>{w.icon}</div>
-                    <div style={S.wxHi}>{w.hi}°</div>
-                    <div style={S.wxLo}>{w.lo}°</div>
-                    <div style={S.wxPop}>{w.pop}%</div>
-                  </div>
-                ))}
-              </div>
+              <>
+                <div style={S.wxRow}>
+                  {weather.days.map((w) => {
+                    const open = w.date === openWeatherDate;
+                    return (
+                      <button key={w.date} onClick={() => setOpenWeatherDate(open ? null : w.date)}
+                        style={{ ...S.wxDay, ...(open ? S.wxDayActive : {}) }} className="cd-weekday">
+                        <div style={S.wxName}>{w.d}</div>
+                        <div style={S.wxIcon}>{w.icon}</div>
+                        <div style={S.wxHi}>{w.hi}°</div>
+                        <div style={S.wxLo}>{w.lo}°</div>
+                        <div style={S.wxPop}>{w.pop}%</div>
+                      </button>
+                    );
+                  })}
+                </div>
+                <WeatherDetail day={weather.days.find(d => d.date === openWeatherDate)} />
+              </>
             ) : <div style={S.empty}>Weather unavailable.</div>}
           </section>
         </div>
       </div>
 
       <section style={S.card} className="cd-card">
-        <div style={S.cardHead}><h2 style={S.h2}>This week</h2><span style={S.cardSub}>tap a day to open it</span></div>
+        <div style={S.cardHead}><h2 style={S.h2}>Next 7 days</h2><span style={S.cardSub}>tap a day to open it</span></div>
         <div style={S.weekRow}>
-          {DAYS.map((dname, i) => {
-            const dateStr = iso(addDays(monday, i));
+          {Array.from({ length: 7 }).map((_, i) => {
+            const d = addDays(today, i);
+            const dateStr = iso(d);
+            const dname = i === 0 ? "Today" : DAYS[(d.getDay()+6)%7];
             const ts = dayTasks(dateStr);
             const active = dateStr === selectedDate;
-            const isTod = dateStr === iso(today);
+            const isTod = i === 0;
             return (
-              <button key={dname} onClick={() => setSelectedDate(dateStr)}
+              <button key={dateStr} onClick={() => setSelectedDate(dateStr)}
                 style={{ ...S.weekDay, ...(active ? S.weekDayActive : {}) }} className="cd-weekday">
                 <div style={S.weekName}>{dname}</div>
-                <div style={{ ...S.weekNum, ...(isTod ? S.weekNumToday : {}) }}>{addDays(monday, i).getDate()}</div>
+                <div style={{ ...S.weekNum, ...(isTod ? S.weekNumToday : {}) }}>{d.getDate()}</div>
                 <div style={S.weekDots}>
                   {ts.slice(0, 5).map((t, j) => (
                     <span key={j} style={{ ...S.weekDot, background: CATS[t.cat].dot, opacity: t.done ? 0.4 : 1 }} />
@@ -281,6 +288,34 @@ function AddRow({ adding, setAdding, onAdd }) {
           Add
         </button>
       </div>
+    </div>
+  );
+}
+
+function WeatherDetail({ day }) {
+  if (!day || !day.hours?.length) {
+    return <div style={S.wxNote}>{day ? "Hourly detail not available for this day." : "Tap a day for hourly detail."}</div>;
+  }
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+  const currentHour = `${String(now.getHours()).padStart(2,"0")}:00`;
+  return (
+    <div style={S.wxDetail}>
+      <div style={S.wxDetailScroll}>
+        {day.hours.map((h) => {
+          const isNow = day.date === todayStr && h.hour === currentHour;
+          return (
+            <div key={h.hour} style={{ ...S.wxHour, ...(isNow ? S.wxHourNow : {}) }}>
+              <div style={S.wxHourTime}>{h.hour.slice(0,2)}</div>
+              <div style={S.wxHourIcon}>{h.icon}</div>
+              <div style={S.wxHourTemp}>{h.temp}°</div>
+              <div style={S.wxHourPrecip}>{h.precip > 0 ? `${h.precip}mm` : "—"}</div>
+              <div style={S.wxHourWind}>{h.wind} m/s</div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={S.wxLegend}>time · temp · precip · wind</div>
     </div>
   );
 }
@@ -397,7 +432,19 @@ const S = {
   woMeta: { fontSize: 13.5, opacity: 0.85, marginTop: 6, fontWeight: 500 },
   woNote: { fontSize: 13, opacity: 0.92, marginTop: 10, lineHeight: 1.45, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.22)" },
   wxRow: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 },
-  wxDay: { textAlign: "center", padding: "6px 2px", borderRadius: 10 },
+  wxDay: { textAlign: "center", padding: "6px 2px", borderRadius: 10, border: "1px solid transparent",
+           background: "transparent", cursor: "pointer", fontFamily: "inherit" },
+  wxDayActive: { background: "#fbf3ec", borderColor: "#c2724f" },
+  wxDetail: { marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}` },
+  wxDetailScroll: { display: "flex", gap: 6, overflowX: "auto", paddingBottom: 6, scrollbarWidth: "thin" },
+  wxHour: { flex: "0 0 56px", textAlign: "center", padding: "8px 4px", borderRadius: 10, background: paper },
+  wxHourNow: { background: "#fbf3ec", boxShadow: "inset 0 0 0 1.5px #c2724f" },
+  wxHourTime: { fontSize: 11, color: muted, fontWeight: 600, fontVariantNumeric: "tabular-nums" },
+  wxHourIcon: { fontSize: 18, margin: "3px 0" },
+  wxHourTemp: { fontSize: 13, fontWeight: 700, color: ink },
+  wxHourPrecip: { fontSize: 10.5, color: "#4f7fc2", marginTop: 3, fontVariantNumeric: "tabular-nums" },
+  wxHourWind: { fontSize: 10, color: muted, marginTop: 1, fontVariantNumeric: "tabular-nums" },
+  wxLegend: { fontSize: 10.5, color: muted, textAlign: "right", marginTop: 6, fontStyle: "italic" },
   wxName: { fontSize: 11, color: muted, fontWeight: 600 },
   wxIcon: { fontSize: 19, margin: "3px 0" },
   wxHi: { fontSize: 13, fontWeight: 700, color: ink },
