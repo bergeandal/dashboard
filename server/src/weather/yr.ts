@@ -30,16 +30,16 @@ let cached: Cached | null = null;
 
 const symbolToEmoji = (code: string): string => {
   if (!code) return "·";
-  if (code.includes("thunder")) return "⛈";
-  if (code.includes("sleet") || code.includes("snow")) return "❄";
-  if (code.includes("heavyrain")) return "🌧";
-  if (code.includes("rain") && code.includes("showers")) return "🌦";
-  if (code.includes("rain")) return "🌧";
-  if (code.includes("fog")) return "🌫";
-  if (code.startsWith("clearsky")) return "☀";
-  if (code.startsWith("fair")) return "🌤";
-  if (code.startsWith("partlycloudy")) return "⛅";
-  if (code.startsWith("cloudy")) return "☁";
+  if (code.includes("thunder")) return "⛈️";
+  if (code.includes("sleet") || code.includes("snow")) return "❄️";
+  if (code.includes("heavyrain")) return "🌧️";
+  if (code.includes("rain") && code.includes("showers")) return "🌦️";
+  if (code.includes("rain")) return "🌧️";
+  if (code.includes("fog")) return "🌫️";
+  if (code.startsWith("clearsky")) return "☀️";
+  if (code.startsWith("fair")) return "🌤️";
+  if (code.startsWith("partlycloudy")) return "⛅️";
+  if (code.startsWith("cloudy")) return "☁️";
   return "·";
 };
 
