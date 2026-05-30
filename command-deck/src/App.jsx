@@ -257,7 +257,7 @@ export default function App() {
 
         <div style={S.rightCol}>
           <section style={{ ...S.card, ...S.workoutCard }} className="cd-card">
-            <div style={S.cardHead}><h2 style={S.h2}>Next workout</h2></div>
+            <div style={S.cardHead}><h2 style={{ ...S.h2, color: "#fff" }}>Next workout</h2></div>
             {nextWorkout ? (
               <>
                 <div style={S.woTitle}>{nextWorkout.title}</div>
@@ -496,7 +496,7 @@ const S = {
                  background: "#fbeae3", color: "#7a3a1f", fontSize: 12.5, border: "1px solid #f0d4c4" },
   header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 26, maxWidth: 1200, marginInline: "auto" },
   kicker: { textTransform: "uppercase", letterSpacing: "0.22em", fontSize: 11, color: muted, fontWeight: 600 },
-  h1: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: "clamp(28px,4vw,42px)", margin: "4px 0 0", letterSpacing: "-0.01em" },
+  h1: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: "clamp(28px,4vw,42px)", margin: "4px 0 0", letterSpacing: "-0.01em", color: ink },
   headerDate: { textAlign: "right" },
   bigDay: { fontFamily: "'Fraunces', serif", fontSize: 40, fontWeight: 700, lineHeight: 1, color: accent },
   bigMonth: { fontSize: 13, color: muted, fontWeight: 500, letterSpacing: "0.04em" },
@@ -505,7 +505,7 @@ const S = {
   card: { background: cardBg, border: `1px solid ${line}`, borderRadius: 22, padding: "20px 22px",
           boxShadow: "0 10px 30px -26px rgba(30,40,70,0.4)", maxWidth: 1200, marginInline: "auto", width: "100%", marginBottom: 0 },
   cardHead: { display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 16, gap: 12 },
-  h2: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: 0 },
+  h2: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: 0, color: ink },
   cardSub: { fontSize: 12.5, color: muted },
   timeline: { display: "flex", flexDirection: "column", gap: 2 },
   tlRow: { display: "grid", gridTemplateColumns: "52px 18px 1fr 24px", gap: 6, alignItems: "stretch" },
