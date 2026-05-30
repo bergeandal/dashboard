@@ -24,22 +24,20 @@ const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); r
 
 const REFRESH_MS = 5 * 60 * 1000;
 
-const loadLocal = (k, fallback) => {
-  try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
-};
-const saveLocal = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const jsonPost = (url, body) =>
+  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 export default function App() {
   const today = useMemo(() => { const d = new Date(); d.setHours(0,0,0,0); return d; }, []);
 
   const [calendarTasks, setCalendarTasks] = useState([]);
   const [weather, setWeather] = useState(null);
-  const [localTasks, setLocalTasks] = useState(() => loadLocal("cd.localTasks", []));
-  const [doneIds, setDoneIds] = useState(() => loadLocal("cd.doneIds", []));
-  const [month, setMonth] = useState(() => loadLocal("cd.month", []));
+  const [localTasks, setLocalTasks] = useState([]);
+  const [doneIds, setDoneIds] = useState([]);
+  const [month, setMonth] = useState([]);
   const [selectedDate, setSelectedDate] = useState(iso(today));
   const [openWeatherDate, setOpenWeatherDate] = useState(null);
-  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const [adding, setAdding] = useState(false);
 
@@ -50,6 +48,9 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCalendarTasks(data.tasks || []);
+      setLocalTasks(data.localTasks || []);
+      setDoneIds(data.doneIds || []);
+      setMonth(data.month || []);
       setWeather(data.weather || null);
       setStatus("ready");
       setError("");
@@ -65,14 +66,31 @@ export default function App() {
     return () => clearInterval(id);
   }, [fetchData]);
 
+  // One-time migration: push any localStorage values to the server, then clear them.
+  useEffect(() => {
+    if (status !== "ready") return;
+    if (localStorage.getItem("cd.migrated")) return;
+    (async () => {
+      try {
+        const lt = JSON.parse(localStorage.getItem("cd.localTasks") || "[]");
+        const di = JSON.parse(localStorage.getItem("cd.doneIds") || "[]");
+        const m  = JSON.parse(localStorage.getItem("cd.month") || "[]");
+        for (const t of lt) await jsonPost("/api/tasks", t);
+        for (const id of di) await fetch(`/api/done/${encodeURIComponent(id)}`, { method: "POST" });
+        for (const e of m) await jsonPost("/api/month", e);
+        localStorage.setItem("cd.migrated", "1");
+        localStorage.removeItem("cd.localTasks");
+        localStorage.removeItem("cd.doneIds");
+        localStorage.removeItem("cd.month");
+        if (lt.length || di.length || m.length) fetchData();
+      } catch (e) { console.warn("migration failed", e); }
+    })();
+  }, [status, fetchData]);
+
   useEffect(() => {
     if (!weather?.days?.length || openWeatherDate) return;
     setOpenWeatherDate(weather.days[0].date);
   }, [weather, openWeatherDate]);
-
-  useEffect(() => saveLocal("cd.localTasks", localTasks), [localTasks]);
-  useEffect(() => saveLocal("cd.doneIds", doneIds), [doneIds]);
-  useEffect(() => saveLocal("cd.month", month), [month]);
 
   const doneSet = useMemo(() => new Set(doneIds), [doneIds]);
   const allTasks = useMemo(() => {
@@ -80,11 +98,38 @@ export default function App() {
     return merged.sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
   }, [calendarTasks, localTasks, doneSet]);
 
-  const toggle = (id) => setDoneIds((prev) => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  const toggle = (id) => {
+    const wasDone = doneSet.has(id);
+    setDoneIds((prev) => wasDone ? prev.filter(x => x !== id) : [...prev, id]);
+    const url = `/api/done/${encodeURIComponent(id)}`;
+    fetch(url, { method: wasDone ? "DELETE" : "POST" }).catch((e) => console.warn("toggle failed", e));
+  };
+
+  const addLocalTask = async (task) => {
+    const res = await jsonPost("/api/tasks", { ...task, date: selectedDate });
+    if (res.ok) {
+      const created = await res.json();
+      setLocalTasks((prev) => [...prev, created]);
+    }
+  };
 
   const removeTask = (id) => {
-    if (id.startsWith("local:")) setLocalTasks((prev) => prev.filter(t => t.id !== id));
-    // Calendar events can't be deleted from the dashboard (Google is source of truth).
+    if (!id.startsWith("local:")) return;
+    setLocalTasks((prev) => prev.filter(t => t.id !== id));
+    fetch(`/api/tasks/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("delete failed", e));
+  };
+
+  const addMonth = async (ev) => {
+    const res = await jsonPost("/api/month", ev);
+    if (res.ok) {
+      const created = await res.json();
+      setMonth((prev) => [...prev, created]);
+    }
+  };
+
+  const removeMonth = (id) => {
+    setMonth((prev) => prev.filter(m => m.id !== id));
+    fetch(`/api/month/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("month delete failed", e));
   };
 
   const dayTasks = (dateStr) =>
@@ -169,7 +214,7 @@ export default function App() {
 
           <AddRow
             adding={adding} setAdding={setAdding}
-            onAdd={(task) => setLocalTasks((prev) => [...prev, { ...task, id: "local:" + Date.now(), date: selectedDate }])}
+            onAdd={addLocalTask}
           />
         </section>
 
@@ -245,11 +290,11 @@ export default function App() {
 
       <section style={S.card} className="cd-card">
         <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>birthdays · invitations · key dates</span></div>
-        <MonthList month={month} setMonth={setMonth} />
+        <MonthList month={month} onAdd={addMonth} onRemove={removeMonth} />
       </section>
 
       <footer style={S.footer}>
-        v2 · calendar + weather from server · dashboard-only tasks stored on this device
+        v2 · everything synced via your home server · refreshes every 5 min
       </footer>
     </div>
   );
@@ -320,7 +365,7 @@ function WeatherDetail({ day }) {
   );
 }
 
-function MonthList({ month, setMonth }) {
+function MonthList({ month, onAdd, onRemove }) {
   const [date, setDate] = useState("");
   const [title, setTitle] = useState("");
   const [cat, setCat] = useState("social");
@@ -340,7 +385,7 @@ function MonthList({ month, setMonth }) {
               </div>
               <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
               <span style={S.monthTitle}>{m.title}</span>
-              <button onClick={() => setMonth(month.filter(x=>x.id!==m.id))} style={S.del} className="cd-del">×</button>
+              <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
             </div>
           );
         })}
@@ -352,7 +397,7 @@ function MonthList({ month, setMonth }) {
           {Object.entries(CATS).map(([k,v]) => <option key={k} value={k}>{v.label}</option>)}
         </select>
         <button style={S.saveBtn} disabled={!date || !title.trim()}
-          onClick={() => { if(!date||!title.trim()) return; setMonth([...month, { id:"e"+Date.now(), date, title:title.trim(), cat }]); setDate(""); setTitle(""); }}>
+          onClick={() => { if(!date||!title.trim()) return; onAdd({ date, title:title.trim(), cat }); setDate(""); setTitle(""); }}>
           Add
         </button>
       </div>

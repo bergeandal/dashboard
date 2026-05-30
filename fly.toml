@@ -7,6 +7,7 @@ primary_region = "arn"
   PORT = "8080"
   LAT = "60.3913"
   LON = "5.3221"
+  DB_PATH = "/app/data/deck.db"
 
 [http_service]
   internal_port = 8080
@@ -14,6 +15,10 @@ primary_region = "arn"
   auto_stop_machines = "stop"
   auto_start_machines = true
   min_machines_running = 0
+
+[[mounts]]
+  source = "deck_data"
+  destination = "/app/data"
 
 [[vm]]
   size = "shared-cpu-1x"

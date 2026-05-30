@@ -4,15 +4,15 @@ import fastifyStatic from "@fastify/static";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { config } from "./config.js";
+import { config, type Category } from "./config.js";
 import { fetchAllTasks } from "./calendar/fetch.js";
 import { getWeather } from "./weather/yr.js";
+import { dbo } from "./db.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ logger: { level: "info" } });
 await app.register(cors, { origin: true });
 
-// Serve the built frontend if present (Docker image copies it to /app/public).
 const publicDir = join(__dirname, "..", "public");
 if (existsSync(publicDir)) {
   await app.register(fastifyStatic, { root: publicDir });
@@ -31,9 +31,12 @@ const parseDate = (s: string | undefined, fallback: Date): Date => {
   return isNaN(+d) ? fallback : d;
 };
 
+const VALID_CATS: Category[] = ["work", "training", "social", "home"];
+const isCat = (s: unknown): s is Category =>
+  typeof s === "string" && (VALID_CATS as string[]).includes(s);
+
 app.get("/api/health", async () => ({ ok: true }));
 
-// Combined endpoint — frontend hits this on load + every few minutes.
 app.get("/api/data", async (req) => {
   const q = req.query as { start?: string; days?: string };
   const now = new Date();
@@ -46,10 +49,67 @@ app.get("/api/data", async (req) => {
     getWeather().catch((e) => { app.log.error(e); return null; }),
   ]);
 
-  return { tasks, weather, fetchedAt: new Date().toISOString() };
+  return {
+    tasks,
+    localTasks: dbo.listLocalTasks(),
+    doneIds: dbo.listDoneIds(),
+    month: dbo.listMonth(),
+    weather,
+    fetchedAt: new Date().toISOString(),
+  };
 });
 
 app.get("/api/weather", async () => getWeather());
+
+// --- Local tasks ---
+app.post("/api/tasks", async (req, reply) => {
+  const b = req.body as any;
+  if (!b?.date || !b?.title || !isCat(b?.cat)) {
+    reply.code(400); return { error: "date, title, cat required" };
+  }
+  const task = {
+    id: "local:" + Date.now() + ":" + Math.random().toString(36).slice(2, 8),
+    date: String(b.date), start: String(b.start ?? ""), end: String(b.end ?? ""),
+    title: String(b.title), cat: b.cat as Category, note: String(b.note ?? ""),
+  };
+  dbo.insertLocalTask(task);
+  return task;
+});
+
+app.delete<{ Params: { id: string } }>("/api/tasks/:id", async (req) => {
+  dbo.deleteLocalTask(req.params.id);
+  return { ok: true };
+});
+
+// --- Done state ---
+app.post<{ Params: { id: string } }>("/api/done/:id", async (req) => {
+  dbo.markDone(req.params.id);
+  return { ok: true };
+});
+
+app.delete<{ Params: { id: string } }>("/api/done/:id", async (req) => {
+  dbo.unmarkDone(req.params.id);
+  return { ok: true };
+});
+
+// --- Month-ahead events ---
+app.post("/api/month", async (req, reply) => {
+  const b = req.body as any;
+  if (!b?.date || !b?.title || !isCat(b?.cat)) {
+    reply.code(400); return { error: "date, title, cat required" };
+  }
+  const ev = {
+    id: "m:" + Date.now() + ":" + Math.random().toString(36).slice(2, 8),
+    date: String(b.date), title: String(b.title), cat: b.cat as Category,
+  };
+  dbo.insertMonth(ev);
+  return ev;
+});
+
+app.delete<{ Params: { id: string } }>("/api/month/:id", async (req) => {
+  dbo.deleteMonth(req.params.id);
+  return { ok: true };
+});
 
 app.listen({ port: config.port, host: "0.0.0.0" })
   .then(() => app.log.info(`Command Deck server on :${config.port}`));
