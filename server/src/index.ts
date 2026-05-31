@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { config, type Category } from "./config.js";
 import { fetchAllTasks, fetchBirthdays } from "./calendar/fetch.js";
 import { getWeather } from "./weather/yr.js";
+import { getFitness } from "./fitness/intervals.js";
 import { dbo } from "./db.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -63,6 +64,22 @@ app.get("/api/data", async (req) => {
 });
 
 app.get("/api/weather", async () => getWeather());
+
+// Fitness/health from intervals.icu — fetched lazily by the workout overlay,
+// kept out of /api/data so the main dashboard load stays light.
+app.get("/api/fitness", async (req, reply) => {
+  if (!config.intervals) {
+    reply.code(503);
+    return { error: "intervals.icu not configured" };
+  }
+  try {
+    return await getFitness();
+  } catch (e) {
+    app.log.error(e);
+    reply.code(502);
+    return { error: "intervals.icu fetch failed" };
+  }
+});
 
 // --- Local tasks ---
 app.post("/api/tasks", async (req, reply) => {

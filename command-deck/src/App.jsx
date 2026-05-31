@@ -45,6 +45,7 @@ export default function App() {
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const [adding, setAdding] = useState(false);
+  const [fitnessOpen, setFitnessOpen] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
@@ -256,8 +257,18 @@ export default function App() {
         </section>
 
         <div style={S.rightCol}>
-          <section style={{ ...S.card, ...S.workoutCard }} className="cd-card">
-            <div style={S.cardHead}><h2 style={{ ...S.h2, color: "#fff" }}>Next workout</h2></div>
+          <section
+            style={{ ...S.card, ...S.workoutCard }}
+            className="cd-card cd-workout"
+            onClick={() => setFitnessOpen(true)}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setFitnessOpen(true); } }}
+          >
+            <div style={S.cardHead}>
+              <h2 style={{ ...S.h2, color: "#fff" }}>Next workout</h2>
+              <span style={S.woOpen}>Fitness ↗</span>
+            </div>
             {nextWorkout ? (
               <>
                 <div style={S.woTitle}>{nextWorkout.title}</div>
@@ -266,7 +277,7 @@ export default function App() {
                 </div>
                 {nextWorkout.note && <div style={S.woNote}>{nextWorkout.note}</div>}
               </>
-            ) : <div style={S.empty}>No upcoming training scheduled.</div>}
+            ) : <div style={{ ...S.empty, color: "rgba(255,255,255,0.8)" }}>No upcoming training scheduled.</div>}
           </section>
 
           <section style={S.card} className="cd-card">
@@ -333,6 +344,178 @@ export default function App() {
       <footer style={S.footer}>
         v2 · everything synced via your home server · refreshes every 5 min
       </footer>
+
+      {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} onClose={() => setFitnessOpen(false)} />}
+    </div>
+  );
+}
+
+const fmtDur = (secs) => {
+  if (!secs) return "—";
+  const h = Math.floor(secs / 3600), m = Math.round((secs % 3600) / 60);
+  return h ? `${h}h${String(m).padStart(2, "0")}` : `${m}min`;
+};
+const fmtSleep = (secs) => {
+  if (!secs) return "—";
+  const h = Math.floor(secs / 3600), m = Math.round((secs % 3600) / 60);
+  return `${h}h ${String(m).padStart(2, "0")}m`;
+};
+const relDay = (dateStr) => {
+  if (!dateStr) return "";
+  const d = new Date(dateStr + "T00:00:00");
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  const diff = Math.round((now - d) / 86400000);
+  if (diff === 0) return "today";
+  if (diff === 1) return "yesterday";
+  return `${diff}d ago`;
+};
+// Form/TSB bands (Coggan): >5 fresh, -10..5 grey/neutral, -30..-10 optimal-ish, <-30 high fatigue.
+const formBand = (f) => {
+  if (f === null || f === undefined) return { label: "—", color: faint };
+  if (f > 5) return { label: "Fresh", color: "#5b96cf" };
+  if (f >= -10) return { label: "Neutral", color: "#6f9e6a" };
+  if (f >= -30) return { label: "Building", color: "#d4a056" };
+  return { label: "Fatigued", color: "#d96a8a" };
+};
+
+function FitnessOverlay({ nextWorkout, onClose }) {
+  const [data, setData] = useState(null);
+  const [state, setState] = useState("loading"); // loading | ready | error
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch("/api/fitness");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        if (alive) { setData(j); setState("ready"); }
+      } catch (e) {
+        if (alive) { setErr(String(e.message || e)); setState("error"); }
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = ""; };
+  }, [onClose]);
+
+  const load = data?.load;
+  const ftp = data?.ftp;
+  const wel = data?.wellness;
+  const band = formBand(load?.form);
+
+  return (
+    <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onClose}>
+      <div style={S.ovPanel} className="cd-ov-panel" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+        <div style={S.ovHead}>
+          <div>
+            <div style={S.kicker}>Fitness &amp; Health</div>
+            <h2 style={S.ovTitle}>Training readiness</h2>
+          </div>
+          <button style={S.ovClose} onClick={onClose} aria-label="Close" className="cd-ov-close">×</button>
+        </div>
+
+        {nextWorkout && (
+          <div style={S.ovNext}>
+            <span style={S.ovNextLabel}>Next up</span>
+            <span style={S.ovNextTitle}>{nextWorkout.title}</span>
+            <span style={S.ovNextMeta}>
+              {nextWorkout.date === iso(new Date()) ? "Today" : DAYS[(new Date(nextWorkout.date + "T00:00:00").getDay() + 6) % 7]}
+              {nextWorkout.start ? ` · ${nextWorkout.start}` : ""}
+            </span>
+          </div>
+        )}
+
+        {state === "loading" && <div style={S.ovLoading}>Reading intervals.icu…</div>}
+        {state === "error" && <div style={S.ovError}>Couldn't load fitness data. ({err})</div>}
+
+        {state === "ready" && data && (
+          <div style={S.ovBody}>
+            {data.staleDays !== null && data.staleDays > 2 && (
+              <div style={S.ovStale}>
+                Last activity {data.staleDays} days ago — intervals.icu may still be syncing.
+              </div>
+            )}
+
+            {/* Training load */}
+            <div style={S.ovSection}>
+              <div style={S.ovSectionHead}>Training load{load?.asOf ? <span style={S.ovAsOf}>as of {relDay(load.asOf)}</span> : null}</div>
+              <div style={S.ovStats}>
+                <Stat label="Fitness" sub="CTL" value={load?.ctl ?? "—"} />
+                <Stat label="Fatigue" sub="ATL" value={load?.atl ?? "—"} />
+                <Stat label="Form" sub="TSB" value={load?.form ?? "—"} accent={band.color} chip={band.label} />
+              </div>
+              <div style={S.ovTssRow}>
+                <span>Last 7 days <b style={S.ovTssNum}>{load?.last7Tss ?? 0}</b> TSS</span>
+                <span>Last 6 weeks <b style={S.ovTssNum}>{load?.last42Tss ?? 0}</b> TSS</span>
+              </div>
+            </div>
+
+            {/* FTP + zones */}
+            <div style={S.ovSection}>
+              <div style={S.ovSectionHead}>Power
+                <span style={S.ovAsOf}>{ftp?.value ? `FTP ${ftp.value} W` : "no FTP set"}{ftp?.lthr ? ` · LTHR ${ftp.lthr}` : ""}{ftp?.maxHr ? ` · max HR ${ftp.maxHr}` : ""}</span>
+              </div>
+              {ftp?.zones?.length ? (
+                <div style={S.ovZones}>
+                  {ftp.zones.map((z, i) => (
+                    <div key={i} style={S.ovZone}>
+                      <span style={{ ...S.ovZoneBar, background: ZONE_COLORS[i] || accent }} />
+                      <span style={S.ovZoneName}>{z.name}</span>
+                      <span style={S.ovZoneW}>{z.from}{z.to ? `–${z.to}` : "+"} W</span>
+                    </div>
+                  ))}
+                </div>
+              ) : <div style={S.empty}>No power zones configured.</div>}
+            </div>
+
+            {/* Recovery / health */}
+            <div style={S.ovSection}>
+              <div style={S.ovSectionHead}>Recovery{wel?.date ? <span style={S.ovAsOf}>as of {relDay(wel.date)}</span> : null}</div>
+              <div style={S.ovStats}>
+                <Stat label="Sleep" value={fmtSleep(wel?.sleepSecs)} sub={wel?.sleepScore != null ? `score ${wel.sleepScore}` : ""} />
+                <Stat label="HRV" sub="ms" value={wel?.hrv ?? "—"} />
+                <Stat label="Resting HR" sub="bpm" value={wel?.restingHR ?? "—"} />
+                <Stat label="Weight" sub="kg" value={wel?.weight ?? "—"} />
+              </div>
+            </div>
+
+            {/* Recent activities */}
+            {data.recent?.length > 0 && (
+              <div style={S.ovSection}>
+                <div style={S.ovSectionHead}>Recent activities</div>
+                <div style={S.ovRecent}>
+                  {data.recent.map((a) => (
+                    <div key={a.id} style={S.ovActRow}>
+                      <span style={S.ovActDate}>{relDay(a.date)}</span>
+                      <span style={S.ovActName}>{a.name}</span>
+                      <span style={S.ovActMeta}>{fmtDur(a.durationSec)}{a.load != null ? ` · ${a.load} TSS` : ""}{a.avgHr ? ` · ${a.avgHr}♥` : ""}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={S.ovFootHint}>Workout-plan generator coming next — this is the data it'll use.</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, sub, value, accent: ac, chip }) {
+  return (
+    <div style={S.ovStat}>
+      <div style={S.ovStatLabel}>{label}{sub ? <span style={S.ovStatSub}> {sub}</span> : null}</div>
+      <div style={{ ...S.ovStatValue, color: ac || ink }}>{value}</div>
+      {chip && <div style={{ ...S.ovStatChip, color: ac, background: `${ac}1f` }}>{chip}</div>}
     </div>
   );
 }
@@ -472,6 +655,9 @@ const accent = "#2f5d9e";
 const accentSoft = "#eef3fa";
 const accentBorder = "#cdddef";
 
+// Power-zone palette: cool → warm as intensity climbs.
+const ZONE_COLORS = ["#9fb6cf", "#6f9e6a", "#5b96cf", "#2f5d9e", "#d4a056", "#d98a5a", "#d96a8a"];
+
 const globalCss = `
   @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Spline+Sans:wght@400;500;600&display=swap');
   * { box-sizing: border-box; }
@@ -486,6 +672,13 @@ const globalCss = `
   .cd-row:hover .cd-del { opacity: 1; }
   .cd-add:hover { background: ${line}; }
   @keyframes rise { from { opacity:0; transform: translateY(10px);} to {opacity:1; transform:none;} }
+  @keyframes ovFade { from { opacity:0; } to { opacity:1; } }
+  @keyframes ovSlide { from { opacity:0; transform: translateY(24px) scale(.98); } to { opacity:1; transform:none; } }
+  .cd-workout { cursor: pointer; }
+  .cd-workout:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px rgba(36,75,128,0.7); }
+  .cd-ov-backdrop { animation: ovFade .2s ease; }
+  .cd-ov-panel { animation: ovSlide .28s cubic-bezier(.2,.8,.25,1); }
+  .cd-ov-close:hover { background: ${line}; color: ${ink}; }
 `;
 
 const S = {
@@ -537,6 +730,49 @@ const S = {
   woTitle: { fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 600, lineHeight: 1.2 },
   woMeta: { fontSize: 13.5, opacity: 0.85, marginTop: 6, fontWeight: 500 },
   woNote: { fontSize: 13, opacity: 0.92, marginTop: 10, lineHeight: 1.45, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.22)" },
+  woOpen: { fontSize: 11.5, fontWeight: 600, color: "rgba(255,255,255,0.85)", letterSpacing: "0.04em" },
+
+  // --- Fitness overlay ---
+  ovBackdrop: { position: "fixed", inset: 0, zIndex: 50, background: "rgba(24,32,52,0.42)", backdropFilter: "blur(3px)",
+                display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "clamp(16px,5vh,64px) 16px", overflowY: "auto" },
+  ovPanel: { width: "100%", maxWidth: 560, background: cardBg, borderRadius: 24, border: `1px solid ${line}`,
+             boxShadow: "0 40px 90px -40px rgba(20,30,60,0.7)", padding: "22px 24px 26px", marginBottom: 32 },
+  ovHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 },
+  ovTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 26, margin: "4px 0 0", color: ink, letterSpacing: "-0.01em" },
+  ovClose: { border: `1px solid ${line}`, background: "#fff", borderRadius: "50%", width: 36, height: 36, fontSize: 22,
+             lineHeight: 1, color: muted, cursor: "pointer", flex: "0 0 auto", transition: "background .2s ease, color .2s ease" },
+  ovNext: { display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap", background: accentSoft, border: `1px solid ${accentBorder}`,
+            borderRadius: 14, padding: "10px 14px", marginBottom: 18 },
+  ovNextLabel: { fontSize: 10.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: accent },
+  ovNextTitle: { fontFamily: "'Fraunces', serif", fontSize: 17, fontWeight: 600, color: ink },
+  ovNextMeta: { fontSize: 12.5, color: muted, marginLeft: "auto" },
+  ovLoading: { fontFamily: "'Fraunces', serif", fontSize: 17, color: muted, padding: "30px 0", textAlign: "center" },
+  ovError: { fontSize: 13.5, color: "#7a3a1f", background: "#fbeae3", border: "1px solid #f0d4c4", borderRadius: 12, padding: "12px 14px" },
+  ovStale: { fontSize: 12.5, color: "#7a5a1f", background: "#faf1de", border: "1px solid #ecdcb6", borderRadius: 12, padding: "9px 13px", marginBottom: 16 },
+  ovBody: { display: "flex", flexDirection: "column", gap: 18 },
+  ovSection: {},
+  ovSectionHead: { fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.09em", color: muted,
+                   marginBottom: 11, display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 },
+  ovAsOf: { fontSize: 11, fontWeight: 500, textTransform: "none", letterSpacing: 0, color: faint },
+  ovStats: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(72px, 1fr))", gap: 8 },
+  ovStat: { background: paper, borderRadius: 14, padding: "11px 12px", textAlign: "left" },
+  ovStatLabel: { fontSize: 11.5, color: muted, fontWeight: 600 },
+  ovStatSub: { fontSize: 10, color: faint, fontWeight: 500 },
+  ovStatValue: { fontFamily: "'Fraunces', serif", fontSize: 26, fontWeight: 700, lineHeight: 1.1, marginTop: 4, fontVariantNumeric: "tabular-nums" },
+  ovStatChip: { display: "inline-block", marginTop: 6, fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 20 },
+  ovTssRow: { display: "flex", justifyContent: "space-between", gap: 12, marginTop: 10, fontSize: 12.5, color: muted },
+  ovTssNum: { fontFamily: "'Fraunces', serif", fontSize: 15, color: ink, fontWeight: 700, margin: "0 3px", fontVariantNumeric: "tabular-nums" },
+  ovZones: { display: "flex", flexDirection: "column", gap: 5 },
+  ovZone: { display: "grid", gridTemplateColumns: "5px 1fr auto", gap: 10, alignItems: "center", padding: "5px 2px" },
+  ovZoneBar: { width: 5, height: 18, borderRadius: 3 },
+  ovZoneName: { fontSize: 13, fontWeight: 500, color: ink },
+  ovZoneW: { fontSize: 12.5, color: muted, fontVariantNumeric: "tabular-nums" },
+  ovRecent: { display: "flex", flexDirection: "column", gap: 1 },
+  ovActRow: { display: "grid", gridTemplateColumns: "74px 1fr auto", gap: 10, alignItems: "center", padding: "7px 2px", borderBottom: `1px solid ${line}` },
+  ovActDate: { fontSize: 11.5, color: faint, fontWeight: 600 },
+  ovActName: { fontSize: 13.5, color: ink, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  ovActMeta: { fontSize: 11.5, color: muted, fontVariantNumeric: "tabular-nums", textAlign: "right" },
+  ovFootHint: { fontSize: 12, color: faint, fontStyle: "italic", textAlign: "center", marginTop: 4 },
   wxRow: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 },
   wxDay: { textAlign: "center", padding: "6px 2px", borderRadius: 10, border: "1px solid transparent",
            background: "transparent", cursor: "pointer", fontFamily: "inherit" },

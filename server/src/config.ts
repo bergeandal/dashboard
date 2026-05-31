@@ -21,4 +21,10 @@ export const config = {
     event: required("ICS_EVENTS"),
   } as Record<Exclude<Category, "birthday">, string>,
   birthdaysFile: process.env.BIRTHDAYS_FILE ?? "./birthdays.ics",
+  // Optional: intervals.icu read layer (training load, FTP, wellness).
+  // Left null when the secrets aren't set so the server still boots.
+  intervals:
+    process.env.INTERVALS_API_KEY && process.env.INTERVALS_ATHLETE_ID
+      ? { apiKey: process.env.INTERVALS_API_KEY, athleteId: process.env.INTERVALS_ATHLETE_ID }
+      : null,
 };
