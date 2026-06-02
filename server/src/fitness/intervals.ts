@@ -13,6 +13,15 @@ import { config } from "../config.js";
    ============================================================ */
 
 export type FitnessZone = { name: string; from: number; to: number | null }; // watts
+export type HrZone = { name: string; from: number; to: number | null }; // bpm
+
+export type WellnessPoint = {
+  date: string; // YYYY-MM-DD
+  sleepSecs: number | null;
+  sleepScore: number | null;
+  hrv: number | null;
+  restingHR: number | null;
+};
 
 export type RecentActivity = {
   id: string;
@@ -39,9 +48,13 @@ export type FitnessPayload = {
   ftp: {
     value: number | null;
     wPrime: number | null;
+    zones: FitnessZone[]; // watts
+  };
+  hr: {
     lthr: number | null;
     maxHr: number | null;
-    zones: FitnessZone[];
+    restingHr: number | null;
+    zones: HrZone[]; // bpm
   };
   wellness: {
     date: string | null; // date of most recent record in window
@@ -50,6 +63,7 @@ export type FitnessPayload = {
     sleepSecs: number | null;
     sleepScore: number | null;
     weight: number | null;
+    series: WellnessPoint[]; // last 14 days, chronological
   };
   recent: RecentActivity[];
 };
@@ -93,6 +107,20 @@ function buildZones(ftp: number | null, pcts: number[] | null, names: string[] |
     const to = pct >= 999 ? null : Math.round((pct / 100) * ftp);
     zones.push({ name: names?.[i] ?? `Z${i + 1}`, from, to });
     prevPct = pct;
+  });
+  return zones;
+}
+
+// HR zones come straight from intervals as bpm upper-bounds; we just pair them
+// with names. %HRR is derived on the frontend (it needs resting HR).
+function buildHrZones(bpms: number[] | null, names: string[] | null): HrZone[] {
+  if (!bpms?.length) return [];
+  const zones: HrZone[] = [];
+  let prev = 0;
+  bpms.forEach((bpm, i) => {
+    const to = bpm >= 999 ? null : bpm;
+    zones.push({ name: names?.[i] ?? `Z${i + 1}`, from: prev, to });
+    prev = bpm;
   });
   return zones;
 }
@@ -143,7 +171,23 @@ export async function getFitness(): Promise<FitnessPayload> {
   const ftpVal = typeof ride.ftp === "number" ? ride.ftp : null;
 
   // --- Wellness: latest non-null per metric (gaps are common) ---
-  const sleepSecs = latestNonNull<number>(wel, "sleepSecs");
+  const restingHr = latestNonNull<number>(wel, "restingHR");
+
+  // 14-day series for the recovery chart, chronological, one slot per day.
+  const seriesStart = +now - 13 * DAY_MS;
+  const byDate = new Map(wel.map((w) => [String(w.id), w]));
+  const series: WellnessPoint[] = [];
+  for (let i = 0; i < 14; i++) {
+    const date = isoDate(new Date(seriesStart + i * DAY_MS));
+    const w = byDate.get(date);
+    series.push({
+      date,
+      sleepSecs: typeof w?.sleepSecs === "number" ? w.sleepSecs : null,
+      sleepScore: round(w?.sleepScore, 0),
+      hrv: round(w?.hrv),
+      restingHR: typeof w?.restingHR === "number" ? w.restingHR : null,
+    });
+  }
 
   const payload: FitnessPayload = {
     asOf: now.toISOString(),
@@ -159,17 +203,22 @@ export async function getFitness(): Promise<FitnessPayload> {
     ftp: {
       value: ftpVal,
       wPrime: typeof ride.w_prime === "number" ? ride.w_prime : null,
+      zones: buildZones(ftpVal, ride.power_zones ?? null, ride.power_zone_names ?? null),
+    },
+    hr: {
       lthr: typeof ride.lthr === "number" ? ride.lthr : null,
       maxHr: typeof ride.max_hr === "number" ? ride.max_hr : null,
-      zones: buildZones(ftpVal, ride.power_zones ?? null, ride.power_zone_names ?? null),
+      restingHr,
+      zones: buildHrZones(ride.hr_zones ?? null, ride.hr_zone_names ?? null),
     },
     wellness: {
       date: wel[0]?.id ?? null,
-      restingHR: latestNonNull<number>(wel, "restingHR"),
+      restingHR: restingHr,
       hrv: round(latestNonNull<number>(wel, "hrv")),
-      sleepSecs,
+      sleepSecs: latestNonNull<number>(wel, "sleepSecs"),
       sleepScore: round(latestNonNull<number>(wel, "sleepScore"), 0),
       weight: round(latestNonNull<number>(wel, "weight")),
+      series,
     },
     recent: acts.slice(0, 8).map((a) => ({
       id: String(a.id),

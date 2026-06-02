@@ -87,10 +87,13 @@ app.post("/api/tasks", async (req, reply) => {
   if (!b?.date || !b?.title || !isCat(b?.cat)) {
     reply.code(400); return { error: "date, title, cat required" };
   }
+  const tssNum = Number(b.tss);
   const task = {
     id: "local:" + Date.now() + ":" + Math.random().toString(36).slice(2, 8),
     date: String(b.date), start: String(b.start ?? ""), end: String(b.end ?? ""),
     title: String(b.title), cat: b.cat as Category, note: String(b.note ?? ""),
+    sport: String(b.sport ?? ""),
+    tss: Number.isFinite(tssNum) && tssNum > 0 ? Math.round(tssNum) : null,
   };
   dbo.insertLocalTask(task);
   return task;
@@ -98,6 +101,16 @@ app.post("/api/tasks", async (req, reply) => {
 
 app.delete<{ Params: { id: string } }>("/api/tasks/:id", async (req) => {
   dbo.deleteLocalTask(req.params.id);
+  return { ok: true };
+});
+
+// Reschedule a local task to another day (push an overdue/undone block forward).
+app.patch<{ Params: { id: string } }>("/api/tasks/:id", async (req, reply) => {
+  const b = req.body as any;
+  const { id } = req.params;
+  if (!id.startsWith("local:")) { reply.code(400); return { error: "only local tasks can be moved" }; }
+  if (!b?.date || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.date))) { reply.code(400); return { error: "valid date required" }; }
+  dbo.moveLocalTask(id, String(b.date));
   return { ok: true };
 });
 
@@ -120,10 +133,19 @@ app.post("/api/month", async (req, reply) => {
   }
   const ev = {
     id: "m:" + Date.now() + ":" + Math.random().toString(36).slice(2, 8),
-    date: String(b.date), title: String(b.title), cat: b.cat as Category,
+    date: String(b.date), start: String(b.start ?? ""), end: String(b.end ?? ""),
+    title: String(b.title), cat: b.cat as Category,
+    important: b.important === false || b.important === 0 ? 0 : 1,
   };
   dbo.insertMonth(ev);
   return ev;
+});
+
+app.patch<{ Params: { id: string } }>("/api/month/:id", async (req, reply) => {
+  const b = req.body as any;
+  if (typeof b?.important !== "boolean") { reply.code(400); return { error: "important (boolean) required" }; }
+  dbo.setMonthImportant(req.params.id, b.important);
+  return { ok: true };
 });
 
 app.delete<{ Params: { id: string } }>("/api/month/:id", async (req) => {

@@ -26,6 +26,85 @@ const iso = (d) => {
 };
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
 
+// "HH:MM" -> minutes since midnight (null for all-day / malformed).
+const hm = (s) => { if (!s || !/^\d{1,2}:\d{2}/.test(s)) return null; const [h, m] = s.split(":").map(Number); return h * 60 + m; };
+const hhmm = (d) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+const fmtRange = (mins) => {
+  const h = Math.floor(mins / 60), m = mins % 60;
+  if (!h) return `${m} min`;
+  if (!m) return `${h} hour${h > 1 ? "s" : ""}`;
+  return `${h}h ${m}m`;
+};
+
+// Per-task glyph — category default, with playful keyword overrides (some Norwegian, for Bergen).
+const CAT_ICON = { work: "💼", training: "🏃", home: "🏡", social: "👥", birthday: "🎂", event: "📅" };
+const taskIcon = (t) => {
+  const s = (t.title || "").toLowerCase();
+  if (t.cat === "training") {
+    if (/\b(bike|cycl|ride|spin|sykk)\w*/.test(s)) return "🚴";
+    if (/\b(run|jog|løp)\w*/.test(s)) return "🏃";
+    if (/\b(swim|svøm)\w*/.test(s)) return "🏊";
+    if (/\b(yoga|mobility|stretch|tøy)\w*/.test(s)) return "🧘";
+    if (/\b(strength|gym|lift|styrke|vekt)\w*/.test(s)) return "🏋️";
+    return "🏃";
+  }
+  if (/\b(call|ring|phone|telefon)\w*/.test(s)) return "📞";
+  if (/\b(meet|møte|standup|sync|1:1)\w*/.test(s)) return "👥";
+  if (/\b(lunch|dinner|breakfast|eat|middag|frokost|mat)\w*/.test(s)) return "🍽️";
+  if (/\b(laundry|clean|vask|rydd)\w*/.test(s)) return "🧺";
+  if (/\b(shop|handle|groceries|butikk)\w*/.test(s)) return "🛒";
+  return CAT_ICON[t.cat] || "•";
+};
+
+// ── Fuelling config ───────────────────────────────────────────────
+// All tunables live here. TODO: surface these in a settings panel so they're
+// adjustable without a redeploy. Carbs in grams; rates in grams/hour.
+const FUEL = {
+  easyRate: 60,          // g/h for easy rides
+  hardRate: 100,         // g/h for hard rides
+  hardIF: 0.78,          // intensity factor at/above which a ride counts as "hard"
+  bottleCarb: 60,        // carbs per full sports-drink bottle
+  bottleStep: 0.5,       // bottles can be half-filled (≈30 g)
+  maxBottles: 2,
+  gelCarb: 25, maxGels: 2,
+  barCarb: 30,  maxBars: 1,
+};
+
+const CYCLING_RE = /\b(bike|cycl|ride|spin|gravel|road|zwift|sykk|sykl)\w*/i;
+const isCycling = (t) => t?.sport === "cycling" || CYCLING_RE.test(t?.title || "");
+
+// Minutes from start→end ("HH:MM"), or null if not a timed block.
+const taskDuration = (t) => {
+  const s = hm(t?.start), e = hm(t?.end);
+  return s != null && e != null && e > s ? e - s : null;
+};
+
+// Intensity Factor back-derived from planned TSS + duration: TSS = hours·IF²·100.
+const rideIF = (tss, hours) => (tss && hours ? Math.sqrt(tss / (100 * hours)) : null);
+
+// Greedy fuelling ladder: bottles first (½-granularity), then gels, then a bar.
+function computeFuel(durationMin, tss, cfg = FUEL) {
+  if (!durationMin || durationMin <= 0) return null;
+  const hours = durationMin / 60;
+  const IF = rideIF(tss, hours);
+  const hard = IF != null && IF >= cfg.hardIF;
+  const rate = hard ? cfg.hardRate : cfg.easyRate;
+  const target = rate * hours;
+
+  const clampStep = (v, step, max) => Math.max(0, Math.min(max, Math.round(v / step) * step));
+  const bottles = clampStep(target / cfg.bottleCarb, cfg.bottleStep, cfg.maxBottles);
+  let rem = target - bottles * cfg.bottleCarb;
+  const gels = Math.max(0, Math.min(cfg.maxGels, Math.round(rem / cfg.gelCarb)));
+  rem -= gels * cfg.gelCarb;
+  const bars = Math.max(0, Math.min(cfg.maxBars, Math.round(rem / cfg.barCarb)));
+
+  const delivered = Math.round(bottles * cfg.bottleCarb + gels * cfg.gelCarb + bars * cfg.barCarb);
+  const capped = target > cfg.maxBottles * cfg.bottleCarb + cfg.maxGels * cfg.gelCarb + cfg.maxBars * cfg.barCarb;
+  return { rate, hard, target: Math.round(target), delivered, capped, bottles, gels, bars, IF };
+}
+
+const fmtCount = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
+
 const REFRESH_MS = 5 * 60 * 1000;
 
 const jsonPost = (url, body) =>
@@ -46,6 +125,13 @@ export default function App() {
   const [error, setError] = useState("");
   const [adding, setAdding] = useState(false);
   const [fitnessOpen, setFitnessOpen] = useState(false);
+  const [now, setNow] = useState(() => new Date());
+
+  // Tick once a minute so the "now" marker, progress fill, and "min remaining" stay live.
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const fetchData = useCallback(async () => {
     try {
@@ -101,9 +187,9 @@ export default function App() {
 
   const doneSet = useMemo(() => new Set(doneIds), [doneIds]);
   const allTasks = useMemo(() => {
-    const merged = [...calendarTasks, ...birthdays, ...localTasks].map((t) => ({ ...t, done: doneSet.has(t.id) }));
+    const merged = [...calendarTasks, ...birthdays, ...localTasks, ...month].map((t) => ({ ...t, done: doneSet.has(t.id) }));
     return merged.sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
-  }, [calendarTasks, birthdays, localTasks, doneSet]);
+  }, [calendarTasks, birthdays, localTasks, month, doneSet]);
 
   const toggle = (id) => {
     const wasDone = doneSet.has(id);
@@ -126,6 +212,14 @@ export default function App() {
     fetch(`/api/tasks/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("delete failed", e));
   };
 
+  const moveTask = (id, date) => {
+    if (!id.startsWith("local:")) return;
+    setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, date } : t));
+    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date }),
+    }).catch((e) => console.warn("move failed", e));
+  };
+
   const addMonth = async (ev) => {
     const res = await jsonPost("/api/month", ev);
     if (res.ok) {
@@ -139,6 +233,13 @@ export default function App() {
     fetch(`/api/month/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("month delete failed", e));
   };
 
+  const toggleMonthImportant = (id, important) => {
+    setMonth((prev) => prev.map(m => m.id === id ? { ...m, important: important ? 1 : 0 } : m));
+    fetch(`/api/month/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ important }),
+    }).catch((e) => console.warn("star failed", e));
+  };
+
   const dayTasks = (dateStr) =>
     allTasks.filter((t) => t.date === dateStr);
 
@@ -146,12 +247,23 @@ export default function App() {
   const selDate = new Date(selectedDate + "T00:00:00");
   const isToday = selectedDate === iso(today);
 
-  const nextWorkout = useMemo(() => {
+  const upcomingTraining = useMemo(() => {
     const todayStr = iso(today);
+    const cutoff = iso(addDays(today, 6));
     return allTasks
-      .filter((t) => t.cat === "training" && !t.done && t.date >= todayStr)
-      .sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start))[0] || null;
+      .filter((t) => t.cat === "training" && t.date >= todayStr && t.date <= cutoff)
+      .sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
   }, [allTasks, today]);
+
+  const nextWorkout = useMemo(
+    () => upcomingTraining.find((t) => !t.done) || null,
+    [upcomingTraining],
+  );
+
+  const nextFuel = useMemo(
+    () => (nextWorkout && isCycling(nextWorkout) ? computeFuel(taskDuration(nextWorkout), nextWorkout.tss) : null),
+    [nextWorkout],
+  );
 
   const { imminent, later } = useMemo(() => {
     const todayStr = iso(today);
@@ -175,11 +287,15 @@ export default function App() {
         if (seen.has(k)) return false;
         seen.add(k); return true;
       });
-    const all = [...month, ...bdays, ...events]
+    // Month-ahead is now curated: only ★-important manual events show here,
+    // alongside birthdays and calendar 'event' items (which always surface).
+    const all = [...month.filter(m => m.important), ...bdays, ...events]
       .filter(e => e.date >= todayStr && e.date <= cutoffStr)
-      .sort((a, b) => a.date.localeCompare(b.date));
+      .sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
+    // Timed items (calendar events + timed month entries) show in the Today timeline,
+    // so keep only untimed reminders/birthdays in the imminent box.
     return {
-      imminent: all.filter(e => e.cat !== "event" && (e.date === todayStr || e.date === tomorrowStr)),
+      imminent: all.filter(e => !e.start && (e.date === todayStr || e.date === tomorrowStr)),
       later: all.filter(e => e.date > tomorrowStr),
     };
   }, [month, birthdays, calendarTasks, today]);
@@ -220,35 +336,7 @@ export default function App() {
             <span style={S.cardSub}>{selDate.getDate()} {MONTHS[selDate.getMonth()].slice(0,3)} · {dayProgress(selectedDate)}% done</span>
           </div>
 
-          <div style={S.timeline}>
-            {selectedTasks.length === 0 && <div style={S.empty}>Nothing scheduled. Tap + to add a block.</div>}
-            {selectedTasks.map((t, i) => (
-              <div key={t.id} style={S.tlRow} className="cd-row">
-                <div style={S.tlTime}>{t.start || "—"}{t.end ? <div style={S.tlTimeEnd}>{t.end}</div> : null}</div>
-                <div style={S.tlMid}>
-                  <div style={{ ...S.tlDot, background: CATS[t.cat].dot }} />
-                  {i < selectedTasks.length - 1 && <div style={S.tlLine} />}
-                </div>
-                <button
-                  onClick={() => toggle(t.id)}
-                  style={{ ...S.tlBlock, background: CATS[t.cat].soft, opacity: t.done ? 0.55 : 1 }}
-                  className="cd-block"
-                >
-                  <div style={S.tlBlockTop}>
-                    <span style={{ ...S.tlTitle, textDecoration: t.done ? "line-through" : "none" }}>{t.title}</span>
-                    <span style={{ ...S.check, borderColor: CATS[t.cat].dot, background: t.done ? CATS[t.cat].dot : "transparent" }}>
-                      {t.done ? "✓" : ""}
-                    </span>
-                  </div>
-                  {t.note && <div style={S.tlNote}>{t.note}</div>}
-                  <span style={{ ...S.tag, color: CATS[t.cat].dot }}>{CATS[t.cat].label}</span>
-                </button>
-                {t.id.startsWith("local:") && (
-                  <button onClick={() => removeTask(t.id)} style={S.del} title="Delete" className="cd-del">×</button>
-                )}
-              </div>
-            ))}
-          </div>
+          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onRemove={removeTask} onMove={moveTask} />
 
           <AddRow
             adding={adding} setAdding={setAdding}
@@ -273,9 +361,27 @@ export default function App() {
               <>
                 <div style={S.woTitle}>{nextWorkout.title}</div>
                 <div style={S.woMeta}>
-                  {nextWorkout.date === iso(today) ? "Today" : DAYS[(new Date(nextWorkout.date+"T00:00:00").getDay()+6)%7]} · {nextWorkout.start}
+                  {[
+                    nextWorkout.date === iso(today) ? "Today" : DAYS[(new Date(nextWorkout.date+"T00:00:00").getDay()+6)%7],
+                    nextWorkout.start && (nextWorkout.end ? `${nextWorkout.start}–${nextWorkout.end}` : nextWorkout.start),
+                    taskDuration(nextWorkout) && fmtRange(taskDuration(nextWorkout)),
+                    nextWorkout.tss && `${nextWorkout.tss} TSS`,
+                  ].filter(Boolean).join(" · ")}
                 </div>
                 {nextWorkout.note && <div style={S.woNote}>{nextWorkout.note}</div>}
+                {nextFuel && (
+                  <div style={S.woFuel}>
+                    <div style={S.woFuelHead}>
+                      Fuelling · {nextFuel.rate} g/h{nextFuel.hard ? " (hard)" : ""} · ~{nextFuel.delivered} g carbs
+                      {nextFuel.capped ? " · capped" : ""}
+                    </div>
+                    <div style={S.woFuelChips}>
+                      <FuelChip icon="🥤" n={nextFuel.bottles} label="Bottles" />
+                      <FuelChip icon="🍬" n={nextFuel.gels} label="Gels" />
+                      <FuelChip icon="🍫" n={nextFuel.bars} label="Bar" />
+                    </div>
+                  </div>
+                )}
               </>
             ) : <div style={{ ...S.empty, color: "rgba(255,255,255,0.8)" }}>No upcoming training scheduled.</div>}
           </section>
@@ -338,14 +444,14 @@ export default function App() {
 
       <section style={S.card} className="cd-card">
         <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>next 30 days</span></div>
-        <MonthList imminent={imminent} later={later} today={today} onAdd={addMonth} onRemove={removeMonth} />
+        <MonthList imminent={imminent} later={later} today={today} onAdd={addMonth} onRemove={removeMonth} onStar={toggleMonthImportant} />
       </section>
 
       <footer style={S.footer}>
         v2 · everything synced via your home server · refreshes every 5 min
       </footer>
 
-      {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} onClose={() => setFitnessOpen(false)} />}
+      {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} upcoming={upcomingTraining} today={today} onClose={() => setFitnessOpen(false)} />}
     </div>
   );
 }
@@ -378,10 +484,11 @@ const formBand = (f) => {
   return { label: "Fatigued", color: "#d96a8a" };
 };
 
-function FitnessOverlay({ nextWorkout, onClose }) {
+function FitnessOverlay({ nextWorkout, upcoming, today, onClose }) {
   const [data, setData] = useState(null);
   const [state, setState] = useState("loading"); // loading | ready | error
   const [err, setErr] = useState("");
+  const [detail, setDetail] = useState(null); // null | "power" | "hr"
 
   useEffect(() => {
     let alive = true;
@@ -399,16 +506,22 @@ function FitnessOverlay({ nextWorkout, onClose }) {
   }, []);
 
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      // Esc backs out of the detail drill-in first, then closes the overlay.
+      if (detail) setDetail(null); else onClose();
+    };
     window.addEventListener("keydown", onKey);
     document.body.style.overflow = "hidden";
     return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = ""; };
-  }, [onClose]);
+  }, [onClose, detail]);
 
   const load = data?.load;
   const ftp = data?.ftp;
+  const hr = data?.hr;
   const wel = data?.wellness;
   const band = formBand(load?.form);
+  const wkg = ftp?.value && wel?.weight ? (ftp.value / wel.weight).toFixed(1) : null;
 
   return (
     <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onClose}>
@@ -421,17 +534,6 @@ function FitnessOverlay({ nextWorkout, onClose }) {
           <button style={S.ovClose} onClick={onClose} aria-label="Close" className="cd-ov-close">×</button>
         </div>
 
-        {nextWorkout && (
-          <div style={S.ovNext}>
-            <span style={S.ovNextLabel}>Next up</span>
-            <span style={S.ovNextTitle}>{nextWorkout.title}</span>
-            <span style={S.ovNextMeta}>
-              {nextWorkout.date === iso(new Date()) ? "Today" : DAYS[(new Date(nextWorkout.date + "T00:00:00").getDay() + 6) % 7]}
-              {nextWorkout.start ? ` · ${nextWorkout.start}` : ""}
-            </span>
-          </div>
-        )}
-
         {state === "loading" && <div style={S.ovLoading}>Reading intervals.icu…</div>}
         {state === "error" && <div style={S.ovError}>Couldn't load fitness data. ({err})</div>}
 
@@ -443,7 +545,13 @@ function FitnessOverlay({ nextWorkout, onClose }) {
               </div>
             )}
 
-            {/* Training load */}
+            {/* This week's plan */}
+            <div style={S.ovSection}>
+              <div style={S.ovSectionHead}>This week<span style={S.ovAsOf}>next 7 days</span></div>
+              <MiniPlan upcoming={upcoming} today={today} nextId={nextWorkout?.id} />
+            </div>
+
+            {/* Training load — the dynamic thing worth watching */}
             <div style={S.ovSection}>
               <div style={S.ovSectionHead}>Training load{load?.asOf ? <span style={S.ovAsOf}>as of {relDay(load.asOf)}</span> : null}</div>
               <div style={S.ovStats}>
@@ -457,57 +565,74 @@ function FitnessOverlay({ nextWorkout, onClose }) {
               </div>
             </div>
 
-            {/* FTP + zones */}
-            <div style={S.ovSection}>
-              <div style={S.ovSectionHead}>Power
-                <span style={S.ovAsOf}>{ftp?.value ? `FTP ${ftp.value} W` : "no FTP set"}{ftp?.lthr ? ` · LTHR ${ftp.lthr}` : ""}{ftp?.maxHr ? ` · max HR ${ftp.maxHr}` : ""}</span>
-              </div>
-              {ftp?.zones?.length ? (
-                <div style={S.ovZones}>
-                  {ftp.zones.map((z, i) => (
-                    <div key={i} style={S.ovZone}>
-                      <span style={{ ...S.ovZoneBar, background: ZONE_COLORS[i] || accent }} />
-                      <span style={S.ovZoneName}>{z.name}</span>
-                      <span style={S.ovZoneW}>{z.from}{z.to ? `–${z.to}` : "+"} W</span>
-                    </div>
-                  ))}
-                </div>
-              ) : <div style={S.empty}>No power zones configured.</div>}
+            {/* Compact threshold boxes — tap to drill into zones */}
+            <div style={S.ovBoxRow}>
+              <MetricBox
+                label="FTP" value={ftp?.value ?? "—"} unit="W"
+                sub={wkg ? `${wkg} W/kg` : (ftp?.value ? "power" : "not set")}
+                disabled={!ftp?.zones?.length}
+                onClick={() => ftp?.zones?.length && setDetail("power")}
+              />
+              <MetricBox
+                label="Threshold HR" value={hr?.lthr ?? "—"} unit="bpm"
+                sub={hr?.maxHr ? `max ${hr.maxHr}` : "heart rate"}
+                disabled={!hr?.zones?.length}
+                onClick={() => hr?.zones?.length && setDetail("hr")}
+              />
             </div>
 
-            {/* Recovery / health */}
+            {/* Recovery — sleep bars + HRV / sleep-score trend lines */}
             <div style={S.ovSection}>
-              <div style={S.ovSectionHead}>Recovery{wel?.date ? <span style={S.ovAsOf}>as of {relDay(wel.date)}</span> : null}</div>
-              <div style={S.ovStats}>
-                <Stat label="Sleep" value={fmtSleep(wel?.sleepSecs)} sub={wel?.sleepScore != null ? `score ${wel.sleepScore}` : ""} />
-                <Stat label="HRV" sub="ms" value={wel?.hrv ?? "—"} />
-                <Stat label="Resting HR" sub="bpm" value={wel?.restingHR ?? "—"} />
-                <Stat label="Weight" sub="kg" value={wel?.weight ?? "—"} />
+              <div style={S.ovSectionHead}>Recovery{wel?.date ? <span style={S.ovAsOf}>14-day trend</span> : null}</div>
+              <RecoveryChart series={wel?.series || []} />
+              <div style={S.ovRecCap}>
+                <span>HRV <b style={{ color: accent }}>{wel?.hrv ?? "—"}</b> ms</span>
+                <span>Sleep <b style={{ color: ink }}>{fmtSleep(wel?.sleepSecs)}</b></span>
+                <span>Resting HR <b style={{ color: ink }}>{wel?.restingHR ?? "—"}</b></span>
+                <span>Weight <b style={{ color: ink }}>{wel?.weight ?? "—"}</b> kg</span>
               </div>
             </div>
-
-            {/* Recent activities */}
-            {data.recent?.length > 0 && (
-              <div style={S.ovSection}>
-                <div style={S.ovSectionHead}>Recent activities</div>
-                <div style={S.ovRecent}>
-                  {data.recent.map((a) => (
-                    <div key={a.id} style={S.ovActRow}>
-                      <span style={S.ovActDate}>{relDay(a.date)}</span>
-                      <span style={S.ovActName}>{a.name}</span>
-                      <span style={S.ovActMeta}>{fmtDur(a.durationSec)}{a.load != null ? ` · ${a.load} TSS` : ""}{a.avgHr ? ` · ${a.avgHr}♥` : ""}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
 
             <div style={S.ovFootHint}>Workout-plan generator coming next — this is the data it'll use.</div>
           </div>
         )}
+
+        {/* Drill-in detail window */}
+        {detail === "power" && (
+          <ZoneDetail
+            title="Power zones" onBack={() => setDetail(null)}
+            head={[ftp?.value ? `FTP ${ftp.value} W` : null, wkg ? `${wkg} W/kg` : null, ftp?.wPrime ? `W' ${(ftp.wPrime / 1000).toFixed(1)} kJ` : null].filter(Boolean).join(" · ")}
+            rows={ftp.zones.map((z, i) => ({
+              color: ZONE_COLORS[i] || accent,
+              name: z.name,
+              main: `${z.from}${z.to ? `–${z.to}` : "+"} W`,
+              pct: ftp.value ? `${Math.round((z.from / ftp.value) * 100)}${z.to ? `–${Math.round((z.to / ftp.value) * 100)}` : "+"}% FTP` : "",
+            }))}
+          />
+        )}
+        {detail === "hr" && (
+          <ZoneDetail
+            title="Heart-rate zones" onBack={() => setDetail(null)}
+            head={[hr?.lthr ? `LTHR ${hr.lthr}` : null, hr?.maxHr ? `max ${hr.maxHr}` : null, hr?.restingHr ? `rest ${hr.restingHr}` : null].filter(Boolean).join(" · ")}
+            rows={hr.zones.map((z, i) => ({
+              color: ZONE_COLORS[i] || accent,
+              name: z.name,
+              main: `${z.from || "<"}${z.to ? `–${z.to}` : "+"} bpm`,
+              pct: hrrPct(z, hr),
+            }))}
+          />
+        )}
       </div>
     </div>
   );
+}
+
+// %HRR (Karvonen): (bpm - rest) / (max - rest). Needs both anchors.
+function hrrPct(z, hr) {
+  if (!hr?.maxHr || !hr?.restingHr) return "";
+  const reserve = hr.maxHr - hr.restingHr;
+  const pc = (bpm) => Math.max(0, Math.round(((bpm - hr.restingHr) / reserve) * 100));
+  return `${pc(z.from)}${z.to ? `–${pc(z.to)}` : "+"}% HRR`;
 }
 
 function Stat({ label, sub, value, accent: ac, chip }) {
@@ -520,12 +645,264 @@ function Stat({ label, sub, value, accent: ac, chip }) {
   );
 }
 
+function MetricBox({ label, value, unit, sub, onClick, disabled }) {
+  return (
+    <button
+      style={{ ...S.ovBox, cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.7 : 1 }}
+      className={disabled ? "" : "cd-ov-box"} onClick={onClick} disabled={disabled}
+    >
+      <div style={S.ovBoxLabel}>{label}{!disabled && <span style={S.ovBoxChevron}>›</span>}</div>
+      <div style={S.ovBoxValue}>{value}<span style={S.ovBoxUnit}> {unit}</span></div>
+      <div style={S.ovBoxSub}>{sub}</div>
+    </button>
+  );
+}
+
+function MiniPlan({ upcoming, today, nextId }) {
+  if (!upcoming?.length) {
+    return <div style={S.ovPlanEmpty}>No training scheduled this week. The plan generator will fill this in.</div>;
+  }
+  return (
+    <div style={S.ovPlan}>
+      {upcoming.map((t) => {
+        const d = new Date(t.date + "T00:00:00");
+        const isToday = t.date === iso(today);
+        const isNext = t.id === nextId;
+        return (
+          <div key={t.id} style={{ ...S.ovPlanRow, ...(isNext ? S.ovPlanNext : {}) }}>
+            <span style={S.ovPlanDay}>{isToday ? "Today" : DAYS[(d.getDay() + 6) % 7]}</span>
+            <span style={{ ...S.ovPlanDot, opacity: t.done ? 0.35 : 1 }} />
+            <span style={{ ...S.ovPlanTitle, textDecoration: t.done ? "line-through" : "none", opacity: t.done ? 0.55 : 1 }}>{t.title}</span>
+            <span style={S.ovPlanTime}>{t.start || ""}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ZoneDetail({ title, head, rows, onBack }) {
+  return (
+    <div style={S.ovDetail} className="cd-ov-panel">
+      <div style={S.ovDetailHead}>
+        <button style={S.ovBack} onClick={onBack} className="cd-ov-close" aria-label="Back">‹</button>
+        <div>
+          <h3 style={S.ovDetailTitle}>{title}</h3>
+          {head && <div style={S.ovDetailSub}>{head}</div>}
+        </div>
+      </div>
+      <div style={S.ovZones}>
+        {rows.map((r, i) => (
+          <div key={i} style={S.ovZoneRow}>
+            <span style={{ ...S.ovZoneBar, background: r.color }} />
+            <span style={S.ovZoneName}>{r.name}</span>
+            <span style={S.ovZonePct}>{r.pct}</span>
+            <span style={S.ovZoneMain}>{r.main}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Hand-rolled SVG: sleep duration as bars, HRV + sleep-score as trend lines.
+// Each line is auto-scaled to its own 14-day range, so you read the *shape*
+// (e.g. an HRV dip = early sickness) rather than absolute axis values.
+function RecoveryChart({ series }) {
+  const pts = series || [];
+  const has = (k) => pts.some((p) => p[k] != null);
+  if (!pts.length || (!has("hrv") && !has("sleepSecs"))) {
+    return <div style={S.empty}>Not enough recovery data yet.</div>;
+  }
+  const W = 320, H = 116, padX = 6, padTop = 10, padBot = 18;
+  const n = pts.length;
+  const plotH = H - padTop - padBot;
+  const x = (i) => padX + (i * (W - 2 * padX)) / (n - 1);
+  const bw = ((W - 2 * padX) / n) * 0.5;
+
+  // Bars: sleep hours against a fixed 10h ceiling so bar height reads absolutely.
+  const sleepH = (s) => (s == null ? null : s / 3600);
+  const barY = (h) => padTop + plotH - Math.min(h / 10, 1) * plotH;
+
+  // Lines: auto-scale to each series' own min/max (with a little padding).
+  const lineY = (val, vals) => {
+    const arr = vals.filter((v) => v != null);
+    if (!arr.length || val == null) return null;
+    let lo = Math.min(...arr), hi = Math.max(...arr);
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const pad = (hi - lo) * 0.15;
+    lo -= pad; hi += pad;
+    return padTop + plotH - ((val - lo) / (hi - lo)) * plotH;
+  };
+  const hrvVals = pts.map((p) => p.hrv);
+  const scoreVals = pts.map((p) => p.sleepScore);
+
+  const path = (vals) => {
+    let d = "", started = false;
+    pts.forEach((p, i) => {
+      const y = lineY(p[vals], pts.map((q) => q[vals]));
+      if (y == null) { started = false; return; }
+      d += `${started ? "L" : "M"}${x(i).toFixed(1)} ${y.toFixed(1)} `;
+      started = true;
+    });
+    return d.trim();
+  };
+
+  const lastIdx = (k) => { for (let i = pts.length - 1; i >= 0; i--) if (pts[i][k] != null) return i; return -1; };
+  const hrvLast = lastIdx("hrv"), scoreLast = lastIdx("sleepScore");
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={S.ovChart} preserveAspectRatio="none">
+      {/* sleep bars */}
+      {pts.map((p, i) => {
+        const h = sleepH(p.sleepSecs);
+        if (h == null) return null;
+        const y = barY(h);
+        return <rect key={i} x={x(i) - bw / 2} y={y} width={bw} height={padTop + plotH - y} rx={1.5} fill="#cfe0f0" />;
+      })}
+      {/* sleep-score line (secondary) */}
+      <path d={path("sleepScore")} fill="none" stroke="#b07ec2" strokeWidth="1.6" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" opacity="0.75" />
+      {/* HRV line (primary — the sickness signal) */}
+      <path d={path("hrv")} fill="none" stroke={accent} strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+      {scoreLast >= 0 && <circle cx={x(scoreLast)} cy={lineY(pts[scoreLast].sleepScore, scoreVals)} r="2.6" fill="#b07ec2" />}
+      {hrvLast >= 0 && <circle cx={x(hrvLast)} cy={lineY(pts[hrvLast].hrv, hrvVals)} r="3" fill={accent} />}
+      {/* end date labels */}
+      <text x={padX} y={H - 5} style={S.ovChartTick} textAnchor="start">{(pts[0].date || "").slice(5)}</text>
+      <text x={W - padX} y={H - 5} style={S.ovChartTick} textAnchor="end">{(pts[n - 1].date || "").slice(5)}</text>
+    </svg>
+  );
+}
+
+function Timeline({ tasks, isToday, now, onToggle, onRemove, onMove }) {
+  if (!tasks.length) {
+    return <div style={S.tlEmpty}>Nothing scheduled. Tap <b>+ Add block</b> to shape your day.</div>;
+  }
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  // Interleave free-time nudges between consecutive timed blocks (Structured-style).
+  const rows = [];
+  tasks.forEach((t, i) => {
+    rows.push({ kind: "task", t });
+    const next = tasks[i + 1];
+    const end = hm(t.end), nStart = next && hm(next.start);
+    if (end != null && nStart != null && nStart - end >= 15) {
+      rows.push({ kind: "gap", from: end, to: nStart, mins: nStart - end });
+    }
+  });
+
+  return (
+    <div style={S.timeline}>
+      {rows.map((r, idx) => {
+        if (r.kind === "gap") {
+          const nowHere = isToday && nowMin >= r.from && nowMin < r.to;
+          return (
+            <div key={`gap-${idx}`} style={S.tlGapRow}>
+              <div style={S.tlTime} />
+              <div style={S.tlSpine}><div style={S.tlLineDash} /></div>
+              <div style={S.tlGap}>
+                <span style={S.tlGapIcon}>🕒</span>
+                {nowHere
+                  ? <span style={S.tlGapNow}>{fmtRange(r.to - nowMin)} of free time right now</span>
+                  : <span>{r.mins <= 30 ? `${r.mins} min to spare — squeeze something in?` : `A ${fmtRange(r.mins)} breather`}</span>}
+              </div>
+            </div>
+          );
+        }
+
+        const t = r.t;
+        const start = hm(t.start), end = hm(t.end);
+        const inProgress = isToday && !t.done && start != null && end != null && nowMin >= start && nowMin < end;
+        const progress = inProgress ? Math.min(1, Math.max(0, (nowMin - start) / (end - start))) : 0;
+        const c = CATS[t.cat] || CATS.work;
+        // Overdue: today, not done, its time has passed. Only local tasks can be rescheduled.
+        const endMin = end ?? start;
+        const overdue = isToday && !t.done && endMin != null && nowMin > endMin;
+        const canPush = overdue && t.id.startsWith("local:");
+
+        return (
+          <div key={t.id} style={S.tlRow} className="cd-row">
+            <div style={S.tlTime}>
+              <div style={inProgress ? S.tlNowTime : null}>{t.start || "all-day"}</div>
+              {t.end ? <div style={S.tlTimeEnd}>{t.end}</div> : null}
+            </div>
+
+            <div style={S.tlSpine}>
+              <div style={S.tlLineFull} />
+              <div
+                style={{ ...S.tlBadge, background: c.soft, border: `2px solid ${c.dot}`,
+                         opacity: t.done ? 0.5 : 1,
+                         boxShadow: inProgress ? `0 0 0 4px ${cardBg}, 0 0 0 7px ${c.soft}` : `0 0 0 4px ${cardBg}` }}
+                className={inProgress ? "cd-badge-live" : ""}
+              >
+                <span style={S.tlBadgeGlyph}>{taskIcon(t)}</span>
+              </div>
+            </div>
+
+            <div style={S.tlBlockCol}>
+              <button
+                onClick={() => onToggle(t.id)}
+                style={{ ...S.tlBlock, ...(inProgress ? S.tlBlockActive : {}), ...(overdue ? S.tlBlockOverdue : {}), opacity: t.done ? 0.62 : 1 }}
+                className="cd-block"
+              >
+                {inProgress && <div style={{ ...S.tlFill, width: `${Math.round(progress * 100)}%`, background: c.soft }} />}
+                <div style={S.tlBlockInner}>
+                  <div style={S.tlBlockTop}>
+                    <span style={{ ...S.tlTitle, textDecoration: t.done ? "line-through" : "none" }}>{t.title}</span>
+                    <span style={{ ...S.check, borderColor: c.dot, background: t.done ? c.dot : "transparent" }}>
+                      {t.done ? "✓" : ""}
+                    </span>
+                  </div>
+                  {inProgress
+                    ? <div style={S.tlRemaining}>{end - nowMin} min remaining</div>
+                    : (t.note ? <div style={S.tlNote}>{t.note}</div> : null)}
+                  {!inProgress && <span style={{ ...S.tag, color: c.dot }}>{c.label}</span>}
+                </div>
+              </button>
+              {canPush && <PushBar taskDate={t.date} onMove={(d) => onMove(t.id, d)} />}
+            </div>
+
+            {t.id.startsWith("local:") && (
+              <button onClick={() => onRemove(t.id)} style={S.del} title="Delete" className="cd-del">×</button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function PushBar({ taskDate, onMove }) {
+  const [pick, setPick] = useState(false);
+  const plus = (n) => { const d = new Date(taskDate + "T00:00:00"); d.setDate(d.getDate() + n); return iso(d); };
+  return (
+    <div style={S.pushBar}>
+      <span style={S.pushHint}>⌛ time's up — push to</span>
+      <button style={S.pushBtn} className="cd-push" onClick={() => onMove(plus(1))}>Tomorrow</button>
+      <button style={S.pushBtn} className="cd-push" onClick={() => onMove(plus(2))}>+2d</button>
+      {pick
+        ? <input type="date" autoFocus min={plus(1)} style={S.pushDate}
+            onChange={(e) => e.target.value && onMove(e.target.value)} />
+        : <button style={S.pushBtn} className="cd-push" onClick={() => setPick(true)}>📅 Pick</button>}
+    </div>
+  );
+}
+
+function FuelChip({ icon, n, label }) {
+  return (
+    <div style={{ ...S.woChip, opacity: n > 0 ? 1 : 0.5 }}>
+      <div style={S.woChipNum}><span style={S.woChipIcon}>{icon}</span> {fmtCount(n)}</div>
+      <div style={S.woChipLbl}>{label}</div>
+    </div>
+  );
+}
+
 function AddRow({ adding, setAdding, onAdd }) {
   const [title, setTitle] = useState("");
   const [start, setStart] = useState("08:00");
   const [end, setEnd] = useState("");
   const [cat, setCat] = useState("work");
   const [note, setNote] = useState("");
+  const [tss, setTss] = useState("");
 
   if (!adding) {
     return <button style={S.addBtn} onClick={() => setAdding(true)} className="cd-add">+ Add block</button>;
@@ -538,6 +915,10 @@ function AddRow({ adding, setAdding, onAdd }) {
         <input type="time" value={end} onChange={(e)=>setEnd(e.target.value)} style={S.input} />
       </div>
       <input placeholder="Note (optional)" value={note} onChange={(e)=>setNote(e.target.value)} style={S.input} />
+      {cat === "training" && (
+        <input type="number" min="0" placeholder="Target TSS (optional — drives fuelling intensity)"
+          value={tss} onChange={(e)=>setTss(e.target.value)} style={S.input} />
+      )}
       <div style={S.catPick}>
         {Object.entries(CATS).map(([k, v]) => (
           <button key={k} onClick={() => setCat(k)}
@@ -549,7 +930,7 @@ function AddRow({ adding, setAdding, onAdd }) {
       <div style={S.addActions}>
         <button style={S.cancelBtn} onClick={() => { setAdding(false); setTitle(""); }}>Cancel</button>
         <button style={S.saveBtn} disabled={!title.trim()}
-          onClick={() => { if(!title.trim()) return; onAdd({ title: title.trim(), start, end, cat, note: note.trim() }); setTitle(""); setEnd(""); setNote(""); setAdding(false); }}>
+          onClick={() => { if(!title.trim()) return; onAdd({ title: title.trim(), start, end, cat, note: note.trim(), tss: cat==="training" && tss ? Number(tss) : null }); setTitle(""); setEnd(""); setNote(""); setTss(""); setAdding(false); }}>
           Add
         </button>
       </div>
@@ -585,10 +966,13 @@ function WeatherDetail({ day }) {
   );
 }
 
-function MonthList({ imminent, later, today, onAdd, onRemove }) {
+function MonthList({ imminent, later, today, onAdd, onRemove, onStar }) {
   const [date, setDate] = useState("");
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
   const [title, setTitle] = useState("");
   const [cat, setCat] = useState("social");
+  const [important, setImportant] = useState(true);
   const todayStr = (d => { const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),da=String(d.getDate()).padStart(2,"0"); return `${y}-${m}-${da}`;})(today);
 
   return (
@@ -620,11 +1004,15 @@ function MonthList({ imminent, later, today, onAdd, onRemove }) {
                 <span style={S.monthDay}>{d.getDate()}</span>
                 <span style={S.monthMon}>{MONTHS[d.getMonth()].slice(0,3)}</span>
               </div>
+              <span style={S.monthTimeCell}>{m.start || ""}</span>
               <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
               <span style={S.monthTitle}>{m.title}</span>
-              {m.id.startsWith("m:") ? (
-                <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
-              ) : <span />}
+              {m.id.startsWith("m:")
+                ? <button onClick={() => onStar(m.id, false)} style={S.starRow} title="Unstar — remove from Month ahead">★</button>
+                : <span />}
+              {m.id.startsWith("m:")
+                ? <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
+                : <span />}
             </div>
           );
         })}
@@ -632,12 +1020,20 @@ function MonthList({ imminent, later, today, onAdd, onRemove }) {
 
       <div style={S.monthAdd}>
         <input type="date" value={date} onChange={(e)=>setDate(e.target.value)} style={{ ...S.input, flex:"0 0 auto" }} />
-        <input placeholder="e.g. Mom's birthday" value={title} onChange={(e)=>setTitle(e.target.value)} style={S.input} />
+        <input type="time" value={start} onChange={(e)=>setStart(e.target.value)} style={{ ...S.input, flex:"0 0 auto" }} title="Start (optional)" />
+        <input type="time" value={end} onChange={(e)=>setEnd(e.target.value)} style={{ ...S.input, flex:"0 0 auto" }} title="End (optional)" />
+        <input placeholder="e.g. Dentist" value={title} onChange={(e)=>setTitle(e.target.value)} style={S.input} />
         <select value={cat} onChange={(e)=>setCat(e.target.value)} style={S.input}>
           {Object.entries(CATS).map(([k,v]) => <option key={k} value={k}>{v.label}</option>)}
         </select>
+        <button
+          onClick={() => setImportant(v => !v)}
+          title={important ? "Important — shows in Month ahead" : "Background — hidden from Month ahead"}
+          style={{ ...S.starBtn, color: important ? "#d4a056" : faint, borderColor: important ? "#e6c98a" : line }}>
+          {important ? "★" : "☆"}
+        </button>
         <button style={S.saveBtn} disabled={!date || !title.trim()}
-          onClick={() => { if(!date||!title.trim()) return; onAdd({ date, title:title.trim(), cat }); setDate(""); setTitle(""); }}>
+          onClick={() => { if(!date||!title.trim()) return; onAdd({ date, start, end, title:title.trim(), cat, important }); setDate(""); setStart(""); setEnd(""); setTitle(""); setImportant(true); }}>
           Add
         </button>
       </div>
@@ -679,6 +1075,10 @@ const globalCss = `
   .cd-ov-backdrop { animation: ovFade .2s ease; }
   .cd-ov-panel { animation: ovSlide .28s cubic-bezier(.2,.8,.25,1); }
   .cd-ov-close:hover { background: ${line}; color: ${ink}; }
+  .cd-ov-box:hover { transform: translateY(-2px); border-color: ${accentBorder}; box-shadow: 0 12px 26px -18px rgba(47,93,158,0.6); }
+  @keyframes badgePulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+  .cd-badge-live { animation: badgePulse 2.4s ease-in-out infinite; }
+  .cd-push:hover { background: ${accentBorder}; }
 `;
 
 const S = {
@@ -700,17 +1100,38 @@ const S = {
   cardHead: { display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 16, gap: 12 },
   h2: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: 0, color: ink },
   cardSub: { fontSize: 12.5, color: muted },
-  timeline: { display: "flex", flexDirection: "column", gap: 2 },
-  tlRow: { display: "grid", gridTemplateColumns: "52px 18px 1fr 24px", gap: 6, alignItems: "stretch" },
-  tlTime: { fontSize: 12.5, color: muted, paddingTop: 12, fontVariantNumeric: "tabular-nums", textAlign: "right" },
+  timeline: { display: "flex", flexDirection: "column", gap: 0 },
+  tlRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 20px", gap: 8, alignItems: "stretch" },
+  tlTime: { fontSize: 12, color: muted, paddingTop: 14, fontVariantNumeric: "tabular-nums", textAlign: "right" },
+  tlNowTime: { color: accent, fontWeight: 700 },
   tlTimeEnd: { fontSize: 11, color: faint, marginTop: 2 },
-  tlMid: { display: "flex", flexDirection: "column", alignItems: "center" },
-  tlDot: { width: 12, height: 12, borderRadius: "50%", marginTop: 13, flex: "0 0 auto", boxShadow: "0 0 0 4px rgba(255,255,255,0.7)" },
-  tlLine: { width: 2, flex: 1, background: line, marginTop: 2, marginBottom: -2 },
-  tlBlock: { textAlign: "left", border: "none", borderRadius: 14, padding: "11px 13px", margin: "5px 0", cursor: "pointer", display: "block", width: "100%" },
+  tlSpine: { position: "relative", display: "flex", justifyContent: "center", alignItems: "flex-start", paddingTop: 9 },
+  tlLineFull: { position: "absolute", top: 0, bottom: 0, left: "50%", marginLeft: -1, width: 2, background: line, zIndex: 0 },
+  tlLineDash: { position: "absolute", top: 0, bottom: 0, left: "50%", marginLeft: -1, width: 0, borderLeft: `2px dashed ${line}`, zIndex: 0 },
+  tlBadge: { position: "relative", zIndex: 1, width: 34, height: 34, borderRadius: "50%", display: "flex",
+             alignItems: "center", justifyContent: "center", flex: "0 0 auto", background: "#fff" },
+  tlBadgeGlyph: { fontSize: 16, lineHeight: 1 },
+  tlBlock: { position: "relative", overflow: "hidden", textAlign: "left", border: `1px solid ${line}`, background: "#fff",
+             borderRadius: 16, padding: 0, margin: "4px 0", cursor: "pointer", display: "block", width: "100%" },
+  tlBlockActive: { border: `1.5px solid ${accent}`, boxShadow: "0 10px 24px -16px rgba(47,93,158,0.65)" },
+  tlBlockInner: { position: "relative", zIndex: 1, padding: "11px 14px" },
+  tlFill: { position: "absolute", top: 0, left: 0, bottom: 0, zIndex: 0, transition: "width .6s ease" },
   tlBlockTop: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 },
   tlTitle: { fontSize: 15, fontWeight: 600, color: ink, lineHeight: 1.3 },
+  tlRemaining: { fontSize: 12.5, fontWeight: 700, color: accent, marginTop: 4, fontVariantNumeric: "tabular-nums" },
   tlNote: { fontSize: 12.5, color: muted, marginTop: 3, lineHeight: 1.4 },
+  tlBlockCol: { minWidth: 0 },
+  tlBlockOverdue: { borderColor: "#e6c3a8", borderStyle: "dashed" },
+  pushBar: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, padding: "0 2px 6px", marginTop: -1 },
+  pushHint: { fontSize: 11, color: "#b5642f", fontStyle: "italic" },
+  pushBtn: { fontSize: 11.5, fontWeight: 600, color: accent, background: accentSoft, border: `1px solid ${accentBorder}`,
+             borderRadius: 8, padding: "3px 9px", cursor: "pointer", fontFamily: "inherit" },
+  pushDate: { fontSize: 11.5, padding: "2px 6px", borderRadius: 8, border: `1px solid ${accentBorder}`, fontFamily: "inherit", color: ink, background: "#fff" },
+  tlGapRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 20px", gap: 8, alignItems: "stretch", minHeight: 30 },
+  tlGap: { display: "flex", alignItems: "center", gap: 8, padding: "4px 2px", fontSize: 12.5, color: faint, fontStyle: "italic" },
+  tlGapIcon: { fontSize: 13, opacity: 0.75, fontStyle: "normal" },
+  tlGapNow: { color: accent, fontWeight: 600, fontStyle: "normal" },
+  tlEmpty: { fontSize: 13.5, color: muted, fontStyle: "italic", padding: "16px 2px", lineHeight: 1.5 },
   tag: { fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", marginTop: 7, display: "inline-block" },
   check: { width: 22, height: 22, borderRadius: "50%", border: "2px solid", display: "flex", alignItems: "center", justifyContent: "center",
            color: "#fff", fontSize: 13, flex: "0 0 auto", fontWeight: 700 },
@@ -731,11 +1152,18 @@ const S = {
   woMeta: { fontSize: 13.5, opacity: 0.85, marginTop: 6, fontWeight: 500 },
   woNote: { fontSize: 13, opacity: 0.92, marginTop: 10, lineHeight: 1.45, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.22)" },
   woOpen: { fontSize: 11.5, fontWeight: 600, color: "rgba(255,255,255,0.85)", letterSpacing: "0.04em" },
+  woFuel: { marginTop: 12, paddingTop: 12, borderTop: "1px solid rgba(255,255,255,0.22)" },
+  woFuelHead: { fontSize: 11.5, fontWeight: 600, color: "rgba(255,255,255,0.88)", letterSpacing: "0.02em", marginBottom: 9 },
+  woFuelChips: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 },
+  woChip: { background: "rgba(255,255,255,0.15)", borderRadius: 12, padding: "9px 8px", textAlign: "center" },
+  woChipNum: { fontFamily: "'Fraunces', serif", fontSize: 19, fontWeight: 700, color: "#fff", lineHeight: 1, fontVariantNumeric: "tabular-nums" },
+  woChipIcon: { fontSize: 13, fontFamily: "'Spline Sans', sans-serif" },
+  woChipLbl: { fontSize: 10.5, color: "rgba(255,255,255,0.8)", marginTop: 5, fontWeight: 500 },
 
   // --- Fitness overlay ---
   ovBackdrop: { position: "fixed", inset: 0, zIndex: 50, background: "rgba(24,32,52,0.42)", backdropFilter: "blur(3px)",
                 display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "clamp(16px,5vh,64px) 16px", overflowY: "auto" },
-  ovPanel: { width: "100%", maxWidth: 560, background: cardBg, borderRadius: 24, border: `1px solid ${line}`,
+  ovPanel: { position: "relative", width: "100%", maxWidth: 560, background: cardBg, borderRadius: 24, border: `1px solid ${line}`,
              boxShadow: "0 40px 90px -40px rgba(20,30,60,0.7)", padding: "22px 24px 26px", marginBottom: 32 },
   ovHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 },
   ovTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 26, margin: "4px 0 0", color: ink, letterSpacing: "-0.01em" },
@@ -773,6 +1201,42 @@ const S = {
   ovActName: { fontSize: 13.5, color: ink, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   ovActMeta: { fontSize: 11.5, color: muted, fontVariantNumeric: "tabular-nums", textAlign: "right" },
   ovFootHint: { fontSize: 12, color: faint, fontStyle: "italic", textAlign: "center", marginTop: 4 },
+
+  // compact 7-day plan
+  ovPlan: { display: "flex", flexDirection: "column", gap: 1 },
+  ovPlanEmpty: { fontSize: 13, color: muted, fontStyle: "italic", background: paper, borderRadius: 12, padding: "12px 14px", lineHeight: 1.4 },
+  ovPlanRow: { display: "grid", gridTemplateColumns: "58px 9px 1fr auto", gap: 10, alignItems: "center", padding: "7px 8px", borderRadius: 10 },
+  ovPlanNext: { background: accentSoft, boxShadow: `inset 0 0 0 1px ${accentBorder}` },
+  ovPlanDay: { fontSize: 12, fontWeight: 700, color: accent, textTransform: "uppercase", letterSpacing: "0.04em" },
+  ovPlanDot: { width: 9, height: 9, borderRadius: "50%", background: CATS.training.dot },
+  ovPlanTitle: { fontSize: 14, fontWeight: 500, color: ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  ovPlanTime: { fontSize: 12, color: muted, fontVariantNumeric: "tabular-nums" },
+
+  // threshold metric boxes
+  ovBoxRow: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+  ovBox: { textAlign: "left", border: `1px solid ${line}`, background: "#fff", borderRadius: 16, padding: "13px 15px", fontFamily: "inherit",
+           transition: "transform .15s ease, box-shadow .2s ease, border-color .2s ease" },
+  ovBoxLabel: { fontSize: 11.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em", color: muted, display: "flex", justifyContent: "space-between", alignItems: "center" },
+  ovBoxChevron: { color: faint, fontSize: 17, lineHeight: 1 },
+  ovBoxValue: { fontFamily: "'Fraunces', serif", fontSize: 30, fontWeight: 700, color: ink, lineHeight: 1.05, marginTop: 5, fontVariantNumeric: "tabular-nums" },
+  ovBoxUnit: { fontSize: 14, fontWeight: 500, color: muted, fontFamily: "'Spline Sans', sans-serif" },
+  ovBoxSub: { fontSize: 12, color: muted, marginTop: 3 },
+
+  // recovery chart
+  ovChart: { width: "100%", height: 132, display: "block" },
+  ovChartTick: { fontSize: 9, fill: faint, fontFamily: "'Spline Sans', sans-serif", fontVariantNumeric: "tabular-nums" },
+  ovRecCap: { display: "flex", flexWrap: "wrap", gap: "4px 16px", marginTop: 8, fontSize: 12.5, color: muted },
+
+  // drill-in detail window
+  ovDetail: { position: "absolute", inset: 0, background: cardBg, borderRadius: 24, padding: "22px 24px 26px", overflowY: "auto", zIndex: 2 },
+  ovDetailHead: { display: "flex", alignItems: "center", gap: 12, marginBottom: 18 },
+  ovBack: { border: `1px solid ${line}`, background: "#fff", borderRadius: "50%", width: 36, height: 36, fontSize: 22, lineHeight: 1,
+            color: muted, cursor: "pointer", flex: "0 0 auto", transition: "background .2s ease, color .2s ease" },
+  ovDetailTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 21, margin: 0, color: ink },
+  ovDetailSub: { fontSize: 12.5, color: muted, marginTop: 2, fontVariantNumeric: "tabular-nums" },
+  ovZoneRow: { display: "grid", gridTemplateColumns: "5px 1fr auto auto", gap: 12, alignItems: "center", padding: "8px 2px", borderBottom: `1px solid ${line}` },
+  ovZonePct: { fontSize: 12, color: muted, fontVariantNumeric: "tabular-nums", textAlign: "right" },
+  ovZoneMain: { fontSize: 13, fontWeight: 600, color: ink, fontVariantNumeric: "tabular-nums", minWidth: 86, textAlign: "right" },
   wxRow: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 },
   wxDay: { textAlign: "center", padding: "6px 2px", borderRadius: 10, border: "1px solid transparent",
            background: "transparent", cursor: "pointer", fontFamily: "inherit" },
@@ -807,7 +1271,11 @@ const S = {
   imminentWhen: { fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 700, color: accent, letterSpacing: "0.02em" },
   imminentTitle: { fontSize: 14.5, fontWeight: 600, color: ink },
   monthList: { display: "flex", flexDirection: "column", gap: 2, marginBottom: 14 },
-  monthItem: { display: "grid", gridTemplateColumns: "46px 10px 1fr 24px", gap: 12, alignItems: "center", padding: "9px 4px", borderBottom: `1px solid ${line}` },
+  monthItem: { display: "grid", gridTemplateColumns: "44px 42px 10px 1fr 20px 24px", gap: 12, alignItems: "center", padding: "9px 4px", borderBottom: `1px solid ${line}` },
+  monthTimeCell: { fontSize: 12.5, color: muted, fontWeight: 500, fontVariantNumeric: "tabular-nums", textAlign: "right" },
+  starBtn: { width: 38, height: 38, flex: "0 0 auto", borderRadius: 10, border: `1px solid ${line}`, background: "#fff",
+             fontSize: 17, lineHeight: 1, cursor: "pointer", fontFamily: "inherit" },
+  starRow: { background: "none", border: "none", color: "#d4a056", fontSize: 16, cursor: "pointer", lineHeight: 1, padding: 0 },
   monthDate: { textAlign: "center" },
   monthDay: { fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 700, display: "block", lineHeight: 1, color: accent },
   monthMon: { fontSize: 10.5, color: muted, textTransform: "uppercase", letterSpacing: "0.05em" },
