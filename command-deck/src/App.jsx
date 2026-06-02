@@ -125,6 +125,9 @@ export default function App() {
   const [error, setError] = useState("");
   const [adding, setAdding] = useState(false);
   const [fitnessOpen, setFitnessOpen] = useState(false);
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const [editTask, setEditTask] = useState(null); // task open in the edit form
+  const [scopePrompt, setScopePrompt] = useState(null); // { mode:'edit'|'delete', task, edited? }
   const [now, setNow] = useState(() => new Date());
 
   // Tick once a minute so the "now" marker, progress fill, and "min remaining" stay live.
@@ -136,7 +139,7 @@ export default function App() {
   const fetchData = useCallback(async () => {
     try {
       const start = iso(today);
-      const res = await fetch(`/api/data?start=${start}&days=60`);
+      const res = await fetch(`/api/data?start=${start}&days=120`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCalendarTasks(data.tasks || []);
@@ -203,6 +206,9 @@ export default function App() {
     if (res.ok) {
       const created = await res.json();
       setLocalTasks((prev) => [...prev, created]);
+    } else {
+      const e = await res.json().catch(() => ({}));
+      alert(`Couldn't save block: ${e.error || `HTTP ${res.status}`}`);
     }
   };
 
@@ -220,11 +226,71 @@ export default function App() {
     }).catch((e) => console.warn("move failed", e));
   };
 
+  const createRecurrence = async (series) => {
+    const res = await jsonPost("/api/recurrences", series);
+    if (res.ok) fetchData();
+    else { const e = await res.json().catch(() => ({})); alert(`Couldn't save repeat: ${e.error || `HTTP ${res.status}`}`); }
+  };
+
+  // --- Edit / delete, with recurrence scope (this / this+following / all) ---
+  const recApi = (path, method, body) =>
+    fetch(`/api/recurrences/${path}`, { method, headers: { "Content-Type": "application/json" }, body: body && JSON.stringify(body) })
+      .then((r) => { if (r.ok) fetchData(); else console.warn("recurrence op failed", r.status); })
+      .catch((e) => console.warn("recurrence op failed", e));
+
+  const editLocalTask = async (id, fields) => {
+    setLocalTasks((prev) => prev.map((t) => t.id === id ? { ...t, ...fields } : t));
+    const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fields),
+    });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); alert(`Couldn't save edit: ${e.error || `HTTP ${res.status}`}`); fetchData(); }
+  };
+
+  const handleEdit = (task) => setEditTask(task);
+
+  const saveEdit = (fields) => {
+    const task = editTask;
+    setEditTask(null);
+    if (!task) return;
+    if (task.recurring) setScopePrompt({ mode: "edit", task, edited: fields });
+    else editLocalTask(task.id, fields);
+  };
+
+  const handleDelete = (task) => {
+    if (task.recurring) setScopePrompt({ mode: "delete", task });
+    else removeTask(task.id);
+  };
+
+  const applyScope = (which) => {
+    const { mode, task, edited } = scopePrompt;
+    const sid = encodeURIComponent(task.seriesId);
+    if (mode === "delete") {
+      if (which === "this") recApi(`${sid}/skip`, "POST", { date: task.date });
+      else if (which === "following") recApi(`${sid}/truncate`, "POST", { date: task.date });
+      else recApi(sid, "DELETE");
+    } else {
+      if (which === "this") {
+        // skip the occurrence, then drop a one-off with the edits on that day
+        fetch(`/api/recurrences/${sid}/skip`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date: task.date }) })
+          .then(() => jsonPost("/api/tasks", { ...edited, date: task.date }))
+          .then(() => fetchData()).catch((e) => console.warn("edit-this failed", e));
+      } else if (which === "following") {
+        recApi(`${sid}/split`, "POST", { date: task.date, ...edited });
+      } else {
+        recApi(sid, "PATCH", edited);
+      }
+    }
+    setScopePrompt(null);
+  };
+
   const addMonth = async (ev) => {
     const res = await jsonPost("/api/month", ev);
     if (res.ok) {
       const created = await res.json();
       setMonth((prev) => [...prev, created]);
+    } else {
+      const e = await res.json().catch(() => ({}));
+      alert(`Couldn't save event: ${e.error || `HTTP ${res.status}`}`);
     }
   };
 
@@ -336,11 +402,12 @@ export default function App() {
             <span style={S.cardSub}>{selDate.getDate()} {MONTHS[selDate.getMonth()].slice(0,3)} · {dayProgress(selectedDate)}% done</span>
           </div>
 
-          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onRemove={removeTask} onMove={moveTask} />
+          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onEdit={handleEdit} onDelete={handleDelete} onMove={moveTask} />
 
           <AddRow
             adding={adding} setAdding={setAdding}
-            onAdd={addLocalTask}
+            onAdd={addLocalTask} onAddRecurring={createRecurrence}
+            selectedDate={selectedDate}
           />
         </section>
 
@@ -416,7 +483,10 @@ export default function App() {
       </div>
 
       <section style={S.card} className="cd-card">
-        <div style={S.cardHead}><h2 style={S.h2}>Next 7 days</h2><span style={S.cardSub}>tap a day to open it</span></div>
+        <div style={S.cardHead}>
+          <h2 style={S.h2}>Next 7 days</h2>
+          <button style={S.calOpenBtn} className="cd-push" onClick={() => setCalendarOpen(true)}>📅 Calendar</button>
+        </div>
         <div style={S.weekRow}>
           {Array.from({ length: 7 }).map((_, i) => {
             const d = addDays(today, i);
@@ -452,6 +522,25 @@ export default function App() {
       </footer>
 
       {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} upcoming={upcomingTraining} today={today} onClose={() => setFitnessOpen(false)} />}
+      {calendarOpen && (
+        <CalendarOverlay
+          selectedDate={selectedDate} today={today}
+          onPick={(ds) => { setSelectedDate(ds); setCalendarOpen(false); }}
+          onClose={() => setCalendarOpen(false)}
+        />
+      )}
+      {editTask && (
+        <EditModal task={editTask} onSave={saveEdit} onClose={() => setEditTask(null)} />
+      )}
+      {scopePrompt && (
+        <ScopePopup
+          mode={scopePrompt.mode} task={scopePrompt.task}
+          onThis={() => applyScope("this")}
+          onFollowing={() => applyScope("following")}
+          onAll={() => applyScope("all")}
+          onClose={() => setScopePrompt(null)}
+        />
+      )}
     </div>
   );
 }
@@ -773,7 +862,92 @@ function RecoveryChart({ series }) {
   );
 }
 
-function Timeline({ tasks, isToday, now, onToggle, onRemove, onMove }) {
+function CalendarOverlay({ selectedDate, today, onPick, onClose }) {
+  const [viewMonth, setViewMonth] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
+  const [byDay, setByDay] = useState({});
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = ""; };
+  }, [onClose]);
+
+  // Monday on/before the 1st — start of the 6-week grid.
+  const gridStart = useMemo(() => {
+    const first = new Date(viewMonth.getFullYear(), viewMonth.getMonth(), 1);
+    return addDays(first, -((first.getDay() + 6) % 7));
+  }, [viewMonth]);
+
+  // The calendar fetches its own window per displayed month, so you can browse anywhere.
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    fetch(`/api/data?start=${iso(gridStart)}&days=42`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((d) => {
+        if (!alive) return;
+        const map = {};
+        const push = (date, cat) => { (map[date] ||= new Set()).add(cat); };
+        (d.tasks || []).forEach((t) => push(t.date, t.cat));
+        (d.birthdays || []).forEach((t) => push(t.date, "birthday"));
+        (d.localTasks || []).forEach((t) => push(t.date, t.cat));
+        (d.month || []).forEach((m) => push(m.date, m.cat));
+        setByDay(map); setLoading(false);
+      })
+      .catch(() => { if (alive) { setByDay({}); setLoading(false); } });
+    return () => { alive = false; };
+  }, [gridStart]);
+
+  const cells = Array.from({ length: 42 }, (_, i) => addDays(gridStart, i));
+  const todayStr = iso(today);
+  const stepMonth = (n) => setViewMonth((m) => new Date(m.getFullYear(), m.getMonth() + n, 1));
+
+  return (
+    <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onClose}>
+      <div style={{ ...S.ovPanel, maxWidth: 680 }} className="cd-ov-panel" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+        <div style={S.ovHead}>
+          <div>
+            <div style={S.kicker}>Calendar</div>
+            <h2 style={S.ovTitle}>{MONTHS[viewMonth.getMonth()]} {viewMonth.getFullYear()}</h2>
+          </div>
+          <div style={S.calNav}>
+            <button style={S.calNavBtn} className="cd-ov-close" onClick={() => stepMonth(-1)} aria-label="Previous month">‹</button>
+            <button style={S.calTodayBtn} className="cd-push" onClick={() => setViewMonth(new Date(today.getFullYear(), today.getMonth(), 1))}>Today</button>
+            <button style={S.calNavBtn} className="cd-ov-close" onClick={() => stepMonth(1)} aria-label="Next month">›</button>
+            <button style={S.ovClose} className="cd-ov-close" onClick={onClose} aria-label="Close">×</button>
+          </div>
+        </div>
+
+        <div style={S.calWeekHead}>
+          {DAYS.map((d) => <div key={d} style={S.calWeekName}>{d}</div>)}
+        </div>
+        <div style={S.calGrid}>
+          {cells.map((d) => {
+            const ds = iso(d);
+            const inMonth = d.getMonth() === viewMonth.getMonth();
+            const cats = byDay[ds] ? [...byDay[ds]] : [];
+            const isTod = ds === todayStr;
+            const isSel = ds === selectedDate;
+            return (
+              <button key={ds} onClick={() => onPick(ds)} className="cd-cal-cell"
+                style={{ ...S.calCell, ...(inMonth ? {} : S.calCellOut), ...(isSel ? S.calCellSel : {}), ...(isTod ? S.calCellToday : {}) }}>
+                <div style={{ ...S.calNum, ...(isTod ? S.calNumToday : {}) }}>{d.getDate()}</div>
+                <div style={S.calDots}>
+                  {cats.slice(0, 5).map((c, j) => <span key={j} style={{ ...S.calDot, background: CATS[c]?.dot || "#888" }} />)}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        <div style={S.calFoot}>{loading ? "Loading…" : "Tap a day to open it"}</div>
+      </div>
+    </div>
+  );
+}
+
+function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove }) {
   if (!tasks.length) {
     return <div style={S.tlEmpty}>Nothing scheduled. Tap <b>+ Add block</b> to shape your day.</div>;
   }
@@ -855,14 +1029,19 @@ function Timeline({ tasks, isToday, now, onToggle, onRemove, onMove }) {
                   {inProgress
                     ? <div style={S.tlRemaining}>{end - nowMin} min remaining</div>
                     : (t.note ? <div style={S.tlNote}>{t.note}</div> : null)}
-                  {!inProgress && <span style={{ ...S.tag, color: c.dot }}>{c.label}</span>}
+                  {!inProgress && (
+                    <span style={{ ...S.tag, color: c.dot }}>{c.label}{t.recurring ? " · ↻" : ""}</span>
+                  )}
                 </div>
               </button>
               {canPush && <PushBar taskDate={t.date} onMove={(d) => onMove(t.id, d)} />}
             </div>
 
-            {t.id.startsWith("local:") && (
-              <button onClick={() => onRemove(t.id)} style={S.del} title="Delete" className="cd-del">×</button>
+            {(t.id.startsWith("local:") || t.recurring) && (
+              <div style={S.tlActions}>
+                <button onClick={() => onEdit(t)} style={S.actBtn} title="Edit" className="cd-del">✎</button>
+                <button onClick={() => onDelete(t)} style={S.actBtn} title={t.recurring ? "Delete (repeating)" : "Delete"} className="cd-del">×</button>
+              </div>
             )}
           </div>
         );
@@ -896,17 +1075,46 @@ function FuelChip({ icon, n, label }) {
   );
 }
 
-function AddRow({ adding, setAdding, onAdd }) {
+function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
+  const defaultWd = ((new Date(selectedDate + "T00:00:00").getDay()) + 6) % 7;
   const [title, setTitle] = useState("");
   const [start, setStart] = useState("08:00");
   const [end, setEnd] = useState("");
   const [cat, setCat] = useState("work");
   const [note, setNote] = useState("");
   const [tss, setTss] = useState("");
+  const [freq, setFreq] = useState("none");
+  const [interval, setIntervalN] = useState(1);
+  const [weekdays, setWeekdays] = useState([defaultWd]);
+  const [endMode, setEndMode] = useState("never");
+  const [until, setUntil] = useState("");
+  const [count, setCount] = useState("");
 
   if (!adding) {
     return <button style={S.addBtn} onClick={() => setAdding(true)} className="cd-add">+ Add block</button>;
   }
+
+  const toggleWd = (i) => setWeekdays((w) => w.includes(i) ? w.filter((x) => x !== i) : [...w, i]);
+  const unit = freq === "daily" ? "day(s)" : freq === "weekly" ? "week(s)" : "month(s)";
+  const invalidEnd = freq !== "none" && ((endMode === "until" && !until) || (endMode === "count" && !count));
+
+  const reset = () => { setTitle(""); setEnd(""); setNote(""); setTss(""); setFreq("none"); setIntervalN(1); setEndMode("never"); setUntil(""); setCount(""); setAdding(false); };
+
+  const submit = () => {
+    if (!title.trim()) return;
+    const base = { title: title.trim(), start, end, cat, note: note.trim(), tss: cat === "training" && tss ? Number(tss) : null };
+    if (freq === "none") {
+      onAdd(base);
+    } else {
+      onAddRecurring({
+        ...base, dtstart: selectedDate, freq, interval: Number(interval) || 1,
+        byweekday: freq === "weekly" ? (weekdays.length ? weekdays : [defaultWd]) : [],
+        endMode, until: endMode === "until" ? until : "", count: endMode === "count" ? (Number(count) || null) : null,
+      });
+    }
+    reset();
+  };
+
   return (
     <div style={S.addPanel}>
       <input autoFocus placeholder="What?" value={title} onChange={(e)=>setTitle(e.target.value)} style={S.input} />
@@ -927,12 +1135,137 @@ function AddRow({ adding, setAdding, onAdd }) {
           </button>
         ))}
       </div>
+
+      <div style={S.repeatRow}>
+        <span style={S.repeatLabel}>↻ Repeat</span>
+        <select value={freq} onChange={(e)=>setFreq(e.target.value)} style={{ ...S.input, flex: 1 }}>
+          <option value="none">Doesn't repeat</option>
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+          <option value="monthly">Monthly</option>
+        </select>
+      </div>
+      {freq !== "none" && (
+        <div style={S.repeatPanel}>
+          <div style={S.repeatInline}>
+            <span style={S.repeatWord}>every</span>
+            <input type="number" min="1" value={interval} onChange={(e)=>setIntervalN(e.target.value)} style={{ ...S.input, width: 60, flex: "0 0 auto" }} />
+            <span style={S.repeatWord}>{unit}</span>
+          </div>
+          {freq === "weekly" && (
+            <div style={S.wdPick}>
+              {DAYS.map((d, i) => (
+                <button key={i} onClick={() => toggleWd(i)}
+                  style={{ ...S.wdChip, ...(weekdays.includes(i) ? S.wdChipOn : {}) }}>{d[0]}</button>
+              ))}
+            </div>
+          )}
+          <div style={S.repeatInline}>
+            <span style={S.repeatWord}>ends</span>
+            <select value={endMode} onChange={(e)=>setEndMode(e.target.value)} style={{ ...S.input, width: 120, flex: "0 0 auto" }}>
+              <option value="never">never</option>
+              <option value="until">on date</option>
+              <option value="count">after N</option>
+            </select>
+            {endMode === "until" && <input type="date" value={until} onChange={(e)=>setUntil(e.target.value)} style={{ ...S.input, flex: "0 0 auto" }} />}
+            {endMode === "count" && <input type="number" min="1" placeholder="N" value={count} onChange={(e)=>setCount(e.target.value)} style={{ ...S.input, width: 70, flex: "0 0 auto" }} />}
+            {endMode === "count" && <span style={S.repeatWord}>times</span>}
+          </div>
+        </div>
+      )}
+
       <div style={S.addActions}>
-        <button style={S.cancelBtn} onClick={() => { setAdding(false); setTitle(""); }}>Cancel</button>
-        <button style={S.saveBtn} disabled={!title.trim()}
-          onClick={() => { if(!title.trim()) return; onAdd({ title: title.trim(), start, end, cat, note: note.trim(), tss: cat==="training" && tss ? Number(tss) : null }); setTitle(""); setEnd(""); setNote(""); setTss(""); setAdding(false); }}>
-          Add
+        <button style={S.cancelBtn} onClick={reset}>Cancel</button>
+        <button style={S.saveBtn} disabled={!title.trim() || invalidEnd} onClick={submit}>
+          {freq === "none" ? "Add" : "Add repeating"}
         </button>
+      </div>
+    </div>
+  );
+}
+
+function ScopePopup({ mode, task, onThis, onFollowing, onAll, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const verb = mode === "edit" ? "Edit" : "Delete";
+  const danger = mode === "delete" ? S.scopeBtnDanger : {};
+  return (
+    <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onClose}>
+      <div style={S.scopePanel} className="cd-ov-panel" onClick={(e)=>e.stopPropagation()} role="dialog" aria-modal="true">
+        <h3 style={S.scopeTitle}>{verb} repeating task</h3>
+        <p style={S.scopeText}>“{task.title}” repeats. Apply this {mode} to:</p>
+        <button style={S.scopeBtn} className="cd-ov-box" onClick={onThis}>
+          This occurrence<span style={S.scopeSub}>{task.date} only</span>
+        </button>
+        <button style={S.scopeBtn} className="cd-ov-box" onClick={onFollowing}>
+          This and following<span style={S.scopeSub}>from {task.date} onward</span>
+        </button>
+        <button style={{ ...S.scopeBtn, ...danger }} className="cd-ov-box" onClick={onAll}>
+          All occurrences<span style={S.scopeSub}>the whole series</span>
+        </button>
+        <button style={S.scopeCancel} onClick={onClose}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function EditModal({ task, onSave, onClose }) {
+  const [title, setTitle] = useState(task.title || "");
+  const [start, setStart] = useState(task.start || "");
+  const [end, setEnd] = useState(task.end || "");
+  const [cat, setCat] = useState(task.cat || "work");
+  const [note, setNote] = useState(task.note || "");
+  const [tss, setTss] = useState(task.tss ? String(task.tss) : "");
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const save = () => {
+    if (!title.trim()) return;
+    onSave({ title: title.trim(), start, end, cat, note: note.trim(), sport: task.sport || "", tss: cat === "training" && tss ? Number(tss) : null });
+  };
+
+  return (
+    <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onClose}>
+      <div style={S.editPanel} className="cd-ov-panel" onClick={(e)=>e.stopPropagation()} role="dialog" aria-modal="true">
+        <div style={S.ovHead}>
+          <div>
+            <div style={S.kicker}>Edit{task.recurring ? " · repeating ↻" : ""}</div>
+            <h2 style={S.ovTitle}>Edit block</h2>
+          </div>
+          <button style={S.ovClose} className="cd-ov-close" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div style={S.addPanel}>
+          <input autoFocus placeholder="What?" value={title} onChange={(e)=>setTitle(e.target.value)} style={S.input} />
+          <div style={S.addGrid}>
+            <input type="time" value={start} onChange={(e)=>setStart(e.target.value)} style={S.input} />
+            <input type="time" value={end} onChange={(e)=>setEnd(e.target.value)} style={S.input} />
+          </div>
+          <input placeholder="Note (optional)" value={note} onChange={(e)=>setNote(e.target.value)} style={S.input} />
+          {cat === "training" && (
+            <input type="number" min="0" placeholder="Target TSS (optional)" value={tss} onChange={(e)=>setTss(e.target.value)} style={S.input} />
+          )}
+          <div style={S.catPick}>
+            {Object.entries(CATS).map(([k, v]) => (
+              <button key={k} onClick={() => setCat(k)}
+                style={{ ...S.catChip, borderColor: v.dot, background: cat===k ? v.soft : "transparent", color: v.dot }}>
+                {v.label}
+              </button>
+            ))}
+          </div>
+          <div style={S.addActions}>
+            <button style={S.cancelBtn} onClick={onClose}>Cancel</button>
+            <button style={S.saveBtn} disabled={!title.trim()} onClick={save}>
+              {task.recurring ? "Save…" : "Save"}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -1079,6 +1412,7 @@ const globalCss = `
   @keyframes badgePulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
   .cd-badge-live { animation: badgePulse 2.4s ease-in-out infinite; }
   .cd-push:hover { background: ${accentBorder}; }
+  .cd-cal-cell:hover { border-color: ${accent}; }
 `;
 
 const S = {
@@ -1101,7 +1435,7 @@ const S = {
   h2: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: 0, color: ink },
   cardSub: { fontSize: 12.5, color: muted },
   timeline: { display: "flex", flexDirection: "column", gap: 0 },
-  tlRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 20px", gap: 8, alignItems: "stretch" },
+  tlRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 24px", gap: 8, alignItems: "stretch" },
   tlTime: { fontSize: 12, color: muted, paddingTop: 14, fontVariantNumeric: "tabular-nums", textAlign: "right" },
   tlNowTime: { color: accent, fontWeight: 700 },
   tlTimeEnd: { fontSize: 11, color: faint, marginTop: 2 },
@@ -1127,11 +1461,13 @@ const S = {
   pushBtn: { fontSize: 11.5, fontWeight: 600, color: accent, background: accentSoft, border: `1px solid ${accentBorder}`,
              borderRadius: 8, padding: "3px 9px", cursor: "pointer", fontFamily: "inherit" },
   pushDate: { fontSize: 11.5, padding: "2px 6px", borderRadius: 8, border: `1px solid ${accentBorder}`, fontFamily: "inherit", color: ink, background: "#fff" },
-  tlGapRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 20px", gap: 8, alignItems: "stretch", minHeight: 30 },
+  tlGapRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 24px", gap: 8, alignItems: "stretch", minHeight: 30 },
   tlGap: { display: "flex", alignItems: "center", gap: 8, padding: "4px 2px", fontSize: 12.5, color: faint, fontStyle: "italic" },
   tlGapIcon: { fontSize: 13, opacity: 0.75, fontStyle: "normal" },
   tlGapNow: { color: accent, fontWeight: 600, fontStyle: "normal" },
   tlEmpty: { fontSize: 13.5, color: muted, fontStyle: "italic", padding: "16px 2px", lineHeight: 1.5 },
+  tlActions: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2 },
+  actBtn: { background: "none", border: "none", color: faint, fontSize: 15, lineHeight: 1, cursor: "pointer", padding: 0 },
   tag: { fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", marginTop: 7, display: "inline-block" },
   check: { width: 22, height: 22, borderRadius: "50%", border: "2px solid", display: "flex", alignItems: "center", justifyContent: "center",
            color: "#fff", fontSize: 13, flex: "0 0 auto", fontWeight: 700 },
@@ -1152,6 +1488,32 @@ const S = {
   woMeta: { fontSize: 13.5, opacity: 0.85, marginTop: 6, fontWeight: 500 },
   woNote: { fontSize: 13, opacity: 0.92, marginTop: 10, lineHeight: 1.45, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.22)" },
   woOpen: { fontSize: 11.5, fontWeight: 600, color: "rgba(255,255,255,0.85)", letterSpacing: "0.04em" },
+  // repeat controls (AddRow)
+  repeatRow: { display: "flex", alignItems: "center", gap: 10, marginTop: 2 },
+  repeatLabel: { fontSize: 12.5, fontWeight: 600, color: muted, flex: "0 0 auto" },
+  repeatPanel: { display: "flex", flexDirection: "column", gap: 9, padding: "10px 12px", background: "#fff", border: `1px solid ${line}`, borderRadius: 12 },
+  repeatInline: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  repeatWord: { fontSize: 13, color: muted },
+  wdPick: { display: "flex", gap: 5, flexWrap: "wrap" },
+  wdChip: { width: 30, height: 30, borderRadius: "50%", border: `1.5px solid ${line}`, background: "transparent",
+            color: muted, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
+  wdChipOn: { borderColor: accent, background: accentSoft, color: accent },
+
+  // scope popup
+  scopePanel: { width: "100%", maxWidth: 360, background: cardBg, borderRadius: 20, border: `1px solid ${line}`,
+                boxShadow: "0 40px 90px -40px rgba(20,30,60,0.7)", padding: "20px 22px 18px", marginTop: "8vh" },
+  editPanel: { width: "100%", maxWidth: 460, background: cardBg, borderRadius: 22, border: `1px solid ${line}`,
+               boxShadow: "0 40px 90px -40px rgba(20,30,60,0.7)", padding: "20px 22px 22px", marginTop: "6vh" },
+  scopeTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: "0 0 6px", color: ink },
+  scopeText: { fontSize: 13.5, color: muted, margin: "0 0 16px", lineHeight: 1.45 },
+  scopeBtn: { display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, width: "100%", textAlign: "left",
+              border: `1px solid ${line}`, background: "#fff", borderRadius: 12, padding: "11px 14px", marginBottom: 9,
+              fontSize: 14.5, fontWeight: 600, color: ink, cursor: "pointer", fontFamily: "inherit" },
+  scopeBtnDanger: { borderColor: "#e6b0b0", color: "#b5402f" },
+  scopeSub: { fontSize: 11.5, fontWeight: 400, color: muted },
+  scopeCancel: { width: "100%", border: "none", background: "transparent", color: muted, fontSize: 13.5, fontWeight: 600,
+                 cursor: "pointer", padding: "6px", fontFamily: "inherit", marginTop: 2 },
+
   woFuel: { marginTop: 12, paddingTop: 12, borderTop: "1px solid rgba(255,255,255,0.22)" },
   woFuelHead: { fontSize: 11.5, fontWeight: 600, color: "rgba(255,255,255,0.88)", letterSpacing: "0.02em", marginBottom: 9 },
   woFuelChips: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 },
@@ -1221,6 +1583,29 @@ const S = {
   ovBoxValue: { fontFamily: "'Fraunces', serif", fontSize: 30, fontWeight: 700, color: ink, lineHeight: 1.05, marginTop: 5, fontVariantNumeric: "tabular-nums" },
   ovBoxUnit: { fontSize: 14, fontWeight: 500, color: muted, fontFamily: "'Spline Sans', sans-serif" },
   ovBoxSub: { fontSize: 12, color: muted, marginTop: 3 },
+
+  // calendar window
+  calOpenBtn: { fontSize: 12.5, fontWeight: 600, color: accent, background: accentSoft, border: `1px solid ${accentBorder}`,
+                borderRadius: 10, padding: "5px 11px", cursor: "pointer", fontFamily: "inherit" },
+  calNav: { display: "flex", alignItems: "center", gap: 7 },
+  calNavBtn: { width: 36, height: 36, borderRadius: "50%", border: `1px solid ${line}`, background: "#fff",
+               fontSize: 20, lineHeight: 1, color: muted, cursor: "pointer", flex: "0 0 auto", transition: "background .2s ease, color .2s ease" },
+  calTodayBtn: { fontSize: 12, fontWeight: 600, color: accent, background: accentSoft, border: `1px solid ${accentBorder}`,
+                 borderRadius: 10, padding: "6px 12px", cursor: "pointer", fontFamily: "inherit" },
+  calWeekHead: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 5, marginBottom: 6 },
+  calWeekName: { fontSize: 11, color: muted, fontWeight: 600, textAlign: "center", textTransform: "uppercase", letterSpacing: "0.04em" },
+  calGrid: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 5 },
+  calCell: { minHeight: 58, border: `1px solid ${line}`, borderRadius: 12, background: "#fff", padding: "6px 3px 5px",
+             display: "flex", flexDirection: "column", alignItems: "center", gap: 5, cursor: "pointer", fontFamily: "inherit",
+             transition: "border-color .15s ease, background .15s ease" },
+  calCellOut: { background: paper, opacity: 0.5 },
+  calCellToday: { borderColor: accent, boxShadow: "0 6px 18px -14px rgba(47,93,158,0.8)" },
+  calCellSel: { background: accentSoft, borderColor: accentBorder },
+  calNum: { fontFamily: "'Fraunces', serif", fontSize: 15, fontWeight: 600, color: ink, lineHeight: 1, fontVariantNumeric: "tabular-nums" },
+  calNumToday: { color: accent, fontWeight: 700 },
+  calDots: { display: "flex", gap: 2.5, flexWrap: "wrap", justifyContent: "center", minHeight: 7 },
+  calDot: { width: 6, height: 6, borderRadius: "50%" },
+  calFoot: { fontSize: 12, color: muted, textAlign: "center", marginTop: 14, fontStyle: "italic" },
 
   // recovery chart
   ovChart: { width: "100%", height: 132, display: "block" },

@@ -8,6 +8,7 @@ import { config, type Category } from "./config.js";
 import { fetchAllTasks, fetchBirthdays } from "./calendar/fetch.js";
 import { getWeather } from "./weather/yr.js";
 import { getFitness } from "./fitness/intervals.js";
+import { expandRecurrence } from "./recurrence.js";
 import { dbo } from "./db.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -32,7 +33,9 @@ const parseDate = (s: string | undefined, fallback: Date): Date => {
   return isNaN(+d) ? fallback : d;
 };
 
-const VALID_CATS: Category[] = ["work", "training", "social", "home"];
+// Must match the categories the add UI offers (CATS in App.jsx), or those
+// picks fail validation and the add silently no-ops.
+const VALID_CATS: Category[] = ["work", "training", "social", "home", "birthday", "event"];
 const isCat = (s: unknown): s is Category =>
   typeof s === "string" && (VALID_CATS as string[]).includes(s);
 
@@ -52,8 +55,27 @@ app.get("/api/data", async (req) => {
     getWeather().catch((e) => { app.log.error(e); return null; }),
   ]);
 
+  // Expand recurring series into virtual task instances within the window.
+  const winStart = start.toISOString().slice(0, 10);
+  const winEnd = end.toISOString().slice(0, 10);
+  const exMap = new Map<string, Set<string>>();
+  for (const e of dbo.listExceptions()) {
+    if (!exMap.has(e.series_id)) exMap.set(e.series_id, new Set());
+    exMap.get(e.series_id)!.add(e.date);
+  }
+  const recurringTasks = dbo.listRecurrences().flatMap((r) => {
+    const skip = exMap.get(r.id);
+    return expandRecurrence(r, winStart, winEnd)
+      .filter((date) => !skip?.has(date))
+      .map((date) => ({
+        id: `rec:${r.id}:${date}`, date, start: r.start, end: r.end,
+        title: r.title, cat: r.cat, note: r.note, sport: r.sport, tss: r.tss,
+        recurring: true, seriesId: r.id,
+      }));
+  });
+
   return {
-    tasks,
+    tasks: [...tasks, ...recurringTasks],
     birthdays,
     localTasks: dbo.listLocalTasks(),
     doneIds: dbo.listDoneIds(),
@@ -104,13 +126,18 @@ app.delete<{ Params: { id: string } }>("/api/tasks/:id", async (req) => {
   return { ok: true };
 });
 
-// Reschedule a local task to another day (push an overdue/undone block forward).
+// Edit a local task (any subset of fields; also covers the reschedule/push case via `date`).
 app.patch<{ Params: { id: string } }>("/api/tasks/:id", async (req, reply) => {
   const b = req.body as any;
   const { id } = req.params;
-  if (!id.startsWith("local:")) { reply.code(400); return { error: "only local tasks can be moved" }; }
-  if (!b?.date || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.date))) { reply.code(400); return { error: "valid date required" }; }
-  dbo.moveLocalTask(id, String(b.date));
+  if (!id.startsWith("local:")) { reply.code(400); return { error: "only local tasks can be edited" }; }
+  if (b.cat !== undefined && !isCat(b.cat)) { reply.code(400); return { error: "invalid cat" }; }
+  if (b.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(b.date))) { reply.code(400); return { error: "invalid date" }; }
+  const partial: Record<string, unknown> = {};
+  for (const k of ["date", "start", "end", "title", "cat", "note", "sport"]) if (b[k] !== undefined) partial[k] = String(b[k]);
+  if (b.tss !== undefined) { const n = Number(b.tss); partial.tss = Number.isFinite(n) && n > 0 ? Math.round(n) : null; }
+  if (!Object.keys(partial).length) { reply.code(400); return { error: "no fields to update" }; }
+  dbo.updateLocalTask(id, partial);
   return { ok: true };
 });
 
@@ -151,6 +178,102 @@ app.patch<{ Params: { id: string } }>("/api/month/:id", async (req, reply) => {
 app.delete<{ Params: { id: string } }>("/api/month/:id", async (req) => {
   dbo.deleteMonth(req.params.id);
   return { ok: true };
+});
+
+// --- Recurring tasks ---
+const VALID_FREQ = ["daily", "weekly", "monthly"];
+const VALID_END = ["never", "until", "count"];
+
+app.post("/api/recurrences", async (req, reply) => {
+  const b = req.body as any;
+  if (!b?.title || !isCat(b?.cat) || !b?.dtstart || !VALID_FREQ.includes(b?.freq) || !VALID_END.includes(b?.endMode)) {
+    reply.code(400); return { error: "title, cat, dtstart, freq, endMode required" };
+  }
+  const tssNum = Number(b.tss);
+  const cnt = Number(b.count);
+  const series = {
+    id: "rec:" + Date.now() + ":" + Math.random().toString(36).slice(2, 8),
+    title: String(b.title), cat: b.cat as Category, note: String(b.note ?? ""),
+    sport: String(b.sport ?? ""), tss: Number.isFinite(tssNum) && tssNum > 0 ? Math.round(tssNum) : null,
+    start: String(b.start ?? ""), end: String(b.end ?? ""), dtstart: String(b.dtstart),
+    freq: b.freq as "daily" | "weekly" | "monthly",
+    interval: Math.max(1, Math.round(Number(b.interval) || 1)),
+    byweekday: Array.isArray(b.byweekday) ? b.byweekday.join(",") : String(b.byweekday ?? ""),
+    endMode: b.endMode as "never" | "until" | "count",
+    until: String(b.until ?? ""),
+    count: b.endMode === "count" && Number.isFinite(cnt) && cnt > 0 ? Math.round(cnt) : null,
+  };
+  dbo.insertRecurrence(series);
+  return series;
+});
+
+app.delete<{ Params: { id: string } }>("/api/recurrences/:id", async (req) => {
+  dbo.deleteRecurrence(req.params.id);
+  return { ok: true };
+});
+
+// Skip a single occurrence ("delete this occurrence").
+app.post<{ Params: { id: string } }>("/api/recurrences/:id/skip", async (req, reply) => {
+  const b = req.body as any;
+  if (!b?.date || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.date))) { reply.code(400); return { error: "valid date required" }; }
+  dbo.addException(req.params.id, String(b.date));
+  return { ok: true };
+});
+
+const dayBefore = (d: string) => new Date(new Date(d + "T00:00:00Z").getTime() - 86400000).toISOString().slice(0, 10);
+
+// Edit the whole series ("all occurrences"): update content/rule fields.
+app.patch<{ Params: { id: string } }>("/api/recurrences/:id", async (req, reply) => {
+  const b = req.body as any;
+  if (b.cat !== undefined && !isCat(b.cat)) { reply.code(400); return { error: "invalid cat" }; }
+  if (b.freq !== undefined && !VALID_FREQ.includes(b.freq)) { reply.code(400); return { error: "invalid freq" }; }
+  if (b.endMode !== undefined && !VALID_END.includes(b.endMode)) { reply.code(400); return { error: "invalid endMode" }; }
+  const partial: Record<string, unknown> = {};
+  for (const k of ["title", "cat", "note", "sport", "start", "end", "dtstart", "freq", "endMode", "until"]) if (b[k] !== undefined) partial[k] = String(b[k]);
+  if (b.interval !== undefined) partial.interval = Math.max(1, Math.round(Number(b.interval) || 1));
+  if (b.byweekday !== undefined) partial.byweekday = Array.isArray(b.byweekday) ? b.byweekday.join(",") : String(b.byweekday);
+  if (b.tss !== undefined) { const n = Number(b.tss); partial.tss = Number.isFinite(n) && n > 0 ? Math.round(n) : null; }
+  if (b.count !== undefined) { const n = Number(b.count); partial.count = Number.isFinite(n) && n > 0 ? Math.round(n) : null; }
+  dbo.updateRecurrence(req.params.id, partial);
+  return { ok: true };
+});
+
+// "This and following" delete: truncate the series to end the day before `date`.
+app.post<{ Params: { id: string } }>("/api/recurrences/:id/truncate", async (req, reply) => {
+  const b = req.body as any;
+  if (!b?.date || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.date))) { reply.code(400); return { error: "valid date required" }; }
+  dbo.updateRecurrence(req.params.id, { endMode: "until", until: dayBefore(String(b.date)), count: null });
+  return { ok: true };
+});
+
+// "This and following" edit: truncate the original, start a new series (same rule, new content) at `date`.
+app.post<{ Params: { id: string } }>("/api/recurrences/:id/split", async (req, reply) => {
+  const b = req.body as any;
+  const orig = dbo.getRecurrence(req.params.id);
+  if (!orig) { reply.code(404); return { error: "series not found" }; }
+  if (!b?.date || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.date))) { reply.code(400); return { error: "valid date required" }; }
+  if (b.cat !== undefined && !isCat(b.cat)) { reply.code(400); return { error: "invalid cat" }; }
+  dbo.updateRecurrence(orig.id, { endMode: "until", until: dayBefore(String(b.date)), count: null });
+
+  const n = Number(b.tss);
+  const carryCount = orig.endMode === "count"; // counting from a new dtstart is ambiguous -> open-ended
+  const series = {
+    id: "rec:" + Date.now() + ":" + Math.random().toString(36).slice(2, 8),
+    title: b.title !== undefined ? String(b.title) : orig.title,
+    cat: (b.cat !== undefined ? b.cat : orig.cat) as Category,
+    note: b.note !== undefined ? String(b.note) : orig.note,
+    sport: b.sport !== undefined ? String(b.sport) : orig.sport,
+    tss: b.tss !== undefined ? (Number.isFinite(n) && n > 0 ? Math.round(n) : null) : orig.tss,
+    start: b.start !== undefined ? String(b.start) : orig.start,
+    end: b.end !== undefined ? String(b.end) : orig.end,
+    dtstart: String(b.date),
+    freq: orig.freq, interval: orig.interval, byweekday: orig.byweekday,
+    endMode: carryCount ? ("never" as const) : orig.endMode,
+    until: carryCount ? "" : orig.until,
+    count: null,
+  };
+  dbo.insertRecurrence(series);
+  return series;
 });
 
 app.listen({ port: config.port, host: "0.0.0.0" })
