@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 
 /* ============================================================
    BERGE — Weekly Command Deck (v2)
@@ -15,7 +15,26 @@ const CATS = {
   event:    { label: "Event",    dot: "#d4a056", soft: "rgba(212,160,86,0.14)" },
 };
 
+// Household profiles. Berge is primary (his calendars + intervals.icu);
+// Amanda is the second deck. Shared events surface in both.
+const PROFILE_IDS = ["berge", "amanda"];
+// Each profile carries a full accent palette; the active one is published as
+// CSS variables on the shell so the whole page re-themes on switch.
+const PROFILES = {
+  berge:  { name: "Berge",  color: "#2f5d9e", soft: "#eef3fa", border: "#cdddef", grad: "linear-gradient(135deg, #2f5d9e 0%, #244b80 100%)", glow: "rgba(36,75,128,0.7)" },
+  amanda: { name: "Amanda", color: "#b5547e", soft: "#fbeef4", border: "#edccda", grad: "linear-gradient(135deg, #b5547e 0%, #8f3f63 100%)", glow: "rgba(143,63,99,0.7)" },
+};
+const profileOf = (p) => PROFILES[p] || PROFILES.berge;
+const themeVars = (p) => {
+  const t = profileOf(p);
+  return { "--accent": t.color, "--accent-soft": t.soft, "--accent-border": t.border, "--accent-grad": t.grad, "--accent-glow": t.glow };
+};
+
 const stripBursdag = (s) => s.replace(/\s*sin\s+bursdag\s*$/i, "").trim();
+
+// Daily blocks and month-ahead events are one store now. Both are editable
+// "stored tasks": new ones carry a `local:` id, migrated month events a `m:` id.
+const isStored = (id) => typeof id === "string" && (id.startsWith("local:") || id.startsWith("m:"));
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
@@ -118,7 +137,6 @@ export default function App() {
   const [weather, setWeather] = useState(null);
   const [localTasks, setLocalTasks] = useState([]);
   const [doneIds, setDoneIds] = useState([]);
-  const [month, setMonth] = useState([]);
   const [selectedDate, setSelectedDate] = useState(iso(today));
   const [openWeatherDate, setOpenWeatherDate] = useState(null);
   const [status, setStatus] = useState("loading");
@@ -129,6 +147,27 @@ export default function App() {
   const [editTask, setEditTask] = useState(null); // task open in the edit form
   const [scopePrompt, setScopePrompt] = useState(null); // { mode:'edit'|'delete', task, edited? }
   const [now, setNow] = useState(() => new Date());
+  const [profile, setProfile] = useState(() => {
+    const p = localStorage.getItem("cd.profile");
+    return PROFILE_IDS.includes(p) ? p : "berge";
+  });
+
+  const switchProfile = (p) => {
+    if (p === profile) return;
+    localStorage.setItem("cd.profile", p);
+    setProfile(p);
+  };
+
+  // Undo ("regret") toast for accidental deletes.
+  const [toast, setToast] = useState(null); // { msg, onUndo }
+  const toastTimer = useRef(null);
+  const dismissToast = () => { if (toastTimer.current) clearTimeout(toastTimer.current); setToast(null); };
+  const showToast = (msg, onUndo) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ msg, onUndo });
+    toastTimer.current = setTimeout(() => setToast(null), 6000);
+  };
+  useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current); }, []);
 
   // Tick once a minute so the "now" marker, progress fill, and "min remaining" stay live.
   useEffect(() => {
@@ -139,14 +178,13 @@ export default function App() {
   const fetchData = useCallback(async () => {
     try {
       const start = iso(today);
-      const res = await fetch(`/api/data?start=${start}&days=120`);
+      const res = await fetch(`/api/data?start=${start}&days=120&profile=${profile}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCalendarTasks(data.tasks || []);
       setBirthdays(data.birthdays || []);
       setLocalTasks(data.localTasks || []);
       setDoneIds(data.doneIds || []);
-      setMonth(data.month || []);
       setWeather(data.weather || null);
       setStatus("ready");
       setError("");
@@ -154,7 +192,7 @@ export default function App() {
       setStatus((s) => s === "ready" ? "ready" : "error");
       setError(String(e.message || e));
     }
-  }, [today]);
+  }, [today, profile]);
 
   useEffect(() => {
     fetchData();
@@ -173,7 +211,8 @@ export default function App() {
         const m  = JSON.parse(localStorage.getItem("cd.month") || "[]");
         for (const t of lt) await jsonPost("/api/tasks", t);
         for (const id of di) await fetch(`/api/done/${encodeURIComponent(id)}`, { method: "POST" });
-        for (const e of m) await jsonPost("/api/month", e);
+        // Month-ahead events are now stored tasks; mark them important on the way in.
+        for (const e of m) await jsonPost("/api/tasks", { ...e, important: e.important === false || e.important === 0 ? 0 : 1 });
         localStorage.setItem("cd.migrated", "1");
         localStorage.removeItem("cd.localTasks");
         localStorage.removeItem("cd.doneIds");
@@ -190,9 +229,9 @@ export default function App() {
 
   const doneSet = useMemo(() => new Set(doneIds), [doneIds]);
   const allTasks = useMemo(() => {
-    const merged = [...calendarTasks, ...birthdays, ...localTasks, ...month].map((t) => ({ ...t, done: doneSet.has(t.id) }));
+    const merged = [...calendarTasks, ...birthdays, ...localTasks].map((t) => ({ ...t, done: doneSet.has(t.id) }));
     return merged.sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
-  }, [calendarTasks, birthdays, localTasks, month, doneSet]);
+  }, [calendarTasks, birthdays, localTasks, doneSet]);
 
   const toggle = (id) => {
     const wasDone = doneSet.has(id);
@@ -201,8 +240,11 @@ export default function App() {
     fetch(url, { method: wasDone ? "DELETE" : "POST" }).catch((e) => console.warn("toggle failed", e));
   };
 
-  const addLocalTask = async (task) => {
-    const res = await jsonPost("/api/tasks", { ...task, date: selectedDate });
+  // One add path for both the daily timeline and the month-ahead adder. The
+  // month adder passes its own date + important:1; daily blocks default to the
+  // selected day. Both land in the same store.
+  const addTask = async (task) => {
+    const res = await jsonPost("/api/tasks", { ...task, date: task.date || selectedDate, profile });
     if (res.ok) {
       const created = await res.json();
       setLocalTasks((prev) => [...prev, created]);
@@ -213,13 +255,20 @@ export default function App() {
   };
 
   const removeTask = (id) => {
-    if (!id.startsWith("local:")) return;
+    if (!isStored(id)) return;
+    const t = localTasks.find((x) => x.id === id);
     setLocalTasks((prev) => prev.filter(t => t.id !== id));
     fetch(`/api/tasks/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("delete failed", e));
+    if (t) showToast(`Deleted “${t.title}”`, async () => {
+      dismissToast();
+      const res = await jsonPost("/api/tasks", t);
+      if (res.ok) { const created = await res.json(); setLocalTasks((prev) => [...prev, created]); }
+      else fetchData();
+    });
   };
 
   const moveTask = (id, date) => {
-    if (!id.startsWith("local:")) return;
+    if (!isStored(id)) return;
     setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, date } : t));
     fetch(`/api/tasks/${encodeURIComponent(id)}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date }),
@@ -227,7 +276,7 @@ export default function App() {
   };
 
   const createRecurrence = async (series) => {
-    const res = await jsonPost("/api/recurrences", series);
+    const res = await jsonPost("/api/recurrences", { ...series, profile });
     if (res.ok) fetchData();
     else { const e = await res.json().catch(() => ({})); alert(`Couldn't save repeat: ${e.error || `HTTP ${res.status}`}`); }
   };
@@ -283,27 +332,22 @@ export default function App() {
     setScopePrompt(null);
   };
 
-  const addMonth = async (ev) => {
-    const res = await jsonPost("/api/month", ev);
-    if (res.ok) {
-      const created = await res.json();
-      setMonth((prev) => [...prev, created]);
-    } else {
-      const e = await res.json().catch(() => ({}));
-      alert(`Couldn't save event: ${e.error || `HTTP ${res.status}`}`);
-    }
-  };
-
-  const removeMonth = (id) => {
-    setMonth((prev) => prev.filter(m => m.id !== id));
-    fetch(`/api/month/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("month delete failed", e));
-  };
-
-  const toggleMonthImportant = (id, important) => {
-    setMonth((prev) => prev.map(m => m.id === id ? { ...m, important: important ? 1 : 0 } : m));
-    fetch(`/api/month/${encodeURIComponent(id)}`, {
+  // Star (★) = surface in Month ahead. Shared = show on both decks. Both are
+  // just fields on the unified store, patched on the task itself.
+  const toggleImportant = (id, important) => {
+    if (!isStored(id)) return;
+    setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, important: important ? 1 : 0 } : t));
+    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ important }),
     }).catch((e) => console.warn("star failed", e));
+  };
+
+  const toggleShared = (id, shared) => {
+    if (!isStored(id)) return;
+    setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, shared: shared ? 1 : 0 } : t));
+    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shared }),
+    }).catch((e) => console.warn("share toggle failed", e));
   };
 
   const dayTasks = (dateStr) =>
@@ -335,7 +379,9 @@ export default function App() {
     const todayStr = iso(today);
     const tomorrowStr = iso(addDays(today, 1));
     const cutoffStr = iso(addDays(today, 30));
-    const seen = new Set(month.map(m => `${m.date}|${m.title}`));
+    // Month ahead = the ★-starred stored tasks (regardless of where they were added).
+    const starred = localTasks.filter(t => t.important);
+    const seen = new Set(starred.map(m => `${m.date}|${m.title}`));
     const bdays = birthdays
       .map(t => ({ id: t.id, date: t.date, title: stripBursdag(t.title), cat: "birthday" }))
       .filter(b => {
@@ -353,9 +399,9 @@ export default function App() {
         if (seen.has(k)) return false;
         seen.add(k); return true;
       });
-    // Month-ahead is now curated: only ★-important manual events show here,
-    // alongside birthdays and calendar 'event' items (which always surface).
-    const all = [...month.filter(m => m.important), ...bdays, ...events]
+    // Month-ahead is curated: ★-starred stored tasks show here, alongside
+    // birthdays and calendar 'event' items (which always surface).
+    const all = [...starred, ...bdays, ...events]
       .filter(e => e.date >= todayStr && e.date <= cutoffStr)
       .sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
     // Timed items (calendar events + timed month entries) show in the Today timeline,
@@ -364,10 +410,10 @@ export default function App() {
       imminent: all.filter(e => !e.start && (e.date === todayStr || e.date === tomorrowStr)),
       later: all.filter(e => e.date > tomorrowStr),
     };
-  }, [month, birthdays, calendarTasks, today]);
+  }, [localTasks, birthdays, calendarTasks, today]);
 
   if (status === "loading") {
-    return <div style={S.shell}><style>{globalCss}</style><div style={S.loading}>Connecting to Command Deck…</div></div>;
+    return <div style={{ ...S.shell, ...themeVars(profile) }}><style>{globalCss}</style><div style={S.loading}>Connecting to Command Deck…</div></div>;
   }
 
   const dayProgress = (dateStr) => {
@@ -377,16 +423,27 @@ export default function App() {
   };
 
   return (
-    <div style={S.shell}>
+    <div style={{ ...S.shell, ...themeVars(profile) }}>
       <style>{globalCss}</style>
 
       <header style={S.header}>
         <div>
-          <div style={S.kicker}>Command Deck</div>
-          <h1 style={S.h1}>Hei, Berge 👋</h1>
+          <div style={S.profileBar}>
+            {PROFILE_IDS.map((id) => {
+              const on = id === profile;
+              return (
+                <button key={id} onClick={() => switchProfile(id)}
+                  style={{ ...S.profilePill, ...(on ? { background: profileOf(id).color, color: "#fff", borderColor: profileOf(id).color } : {}) }}
+                  className="cd-push" aria-pressed={on}>
+                  {profileOf(id).name}
+                </button>
+              );
+            })}
+          </div>
+          <h1 style={S.h1}>Hei, {profileOf(profile).name} 👋</h1>
         </div>
         <div style={S.headerDate}>
-          <div style={S.bigDay}>{today.getDate()}</div>
+          <div style={{ ...S.bigDay, color: profileOf(profile).color }}>{today.getDate()}</div>
           <div style={S.bigMonth}>{MONTHS[today.getMonth()].slice(0,3)} {today.getFullYear()}</div>
         </div>
       </header>
@@ -395,94 +452,7 @@ export default function App() {
         <div style={S.errorBanner}>Couldn't reach server — showing last fetch. ({error})</div>
       )}
 
-      <div style={S.grid}>
-        <section style={{ ...S.card, gridColumn: "1 / 2" }} className="cd-card">
-          <div style={S.cardHead}>
-            <h2 style={S.h2}>{isToday ? "Today" : DAYS[(selDate.getDay()+6)%7]}</h2>
-            <span style={S.cardSub}>{selDate.getDate()} {MONTHS[selDate.getMonth()].slice(0,3)} · {dayProgress(selectedDate)}% done</span>
-          </div>
-
-          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onEdit={handleEdit} onDelete={handleDelete} onMove={moveTask} />
-
-          <AddRow
-            adding={adding} setAdding={setAdding}
-            onAdd={addLocalTask} onAddRecurring={createRecurrence}
-            selectedDate={selectedDate}
-          />
-        </section>
-
-        <div style={S.rightCol}>
-          <section
-            style={{ ...S.card, ...S.workoutCard }}
-            className="cd-card cd-workout"
-            onClick={() => setFitnessOpen(true)}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setFitnessOpen(true); } }}
-          >
-            <div style={S.cardHead}>
-              <h2 style={{ ...S.h2, color: "#fff" }}>Next workout</h2>
-              <span style={S.woOpen}>Fitness ↗</span>
-            </div>
-            {nextWorkout ? (
-              <>
-                <div style={S.woTitle}>{nextWorkout.title}</div>
-                <div style={S.woMeta}>
-                  {[
-                    nextWorkout.date === iso(today) ? "Today" : DAYS[(new Date(nextWorkout.date+"T00:00:00").getDay()+6)%7],
-                    nextWorkout.start && (nextWorkout.end ? `${nextWorkout.start}–${nextWorkout.end}` : nextWorkout.start),
-                    taskDuration(nextWorkout) && fmtRange(taskDuration(nextWorkout)),
-                    nextWorkout.tss && `${nextWorkout.tss} TSS`,
-                  ].filter(Boolean).join(" · ")}
-                </div>
-                {nextWorkout.note && <div style={S.woNote}>{nextWorkout.note}</div>}
-                {nextFuel && (
-                  <div style={S.woFuel}>
-                    <div style={S.woFuelHead}>
-                      Fuelling · {nextFuel.rate} g/h{nextFuel.hard ? " (hard)" : ""} · ~{nextFuel.delivered} g carbs
-                      {nextFuel.capped ? " · capped" : ""}
-                    </div>
-                    <div style={S.woFuelChips}>
-                      <FuelChip icon="🥤" n={nextFuel.bottles} label="Bottles" />
-                      <FuelChip icon="🍬" n={nextFuel.gels} label="Gels" />
-                      <FuelChip icon="🍫" n={nextFuel.bars} label="Bar" />
-                    </div>
-                  </div>
-                )}
-              </>
-            ) : <div style={{ ...S.empty, color: "rgba(255,255,255,0.8)" }}>No upcoming training scheduled.</div>}
-          </section>
-
-          <section style={S.card} className="cd-card">
-            <div style={S.cardHead}>
-              <h2 style={S.h2}>{weather?.place || "Bergen"}</h2>
-              <span style={S.cardSub}>{weather ? "Live from YR.no" : "Loading…"}</span>
-            </div>
-            {weather?.days?.length ? (
-              <>
-                <div style={S.wxRow}>
-                  {weather.days.map((w) => {
-                    const open = w.date === openWeatherDate;
-                    return (
-                      <button key={w.date} onClick={() => setOpenWeatherDate(open ? null : w.date)}
-                        style={{ ...S.wxDay, ...(open ? S.wxDayActive : {}) }} className="cd-weekday">
-                        <div style={S.wxName}>{w.d}</div>
-                        <div style={S.wxIcon}>{w.icon}</div>
-                        <div style={S.wxHi}>{w.hi}°</div>
-                        <div style={S.wxLo}>{w.lo}°</div>
-                        <div style={S.wxPop}>{w.pop}%</div>
-                      </button>
-                    );
-                  })}
-                </div>
-                <WeatherDetail day={weather.days.find(d => d.date === openWeatherDate)} />
-              </>
-            ) : <div style={S.empty}>Weather unavailable.</div>}
-          </section>
-        </div>
-      </div>
-
-      <section style={S.card} className="cd-card">
+      <section style={{ ...S.card, ...S.weekCard }} className="cd-card">
         <div style={S.cardHead}>
           <h2 style={S.h2}>Next 7 days</h2>
           <button style={S.calOpenBtn} className="cd-push" onClick={() => setCalendarOpen(true)}>📅 Calendar</button>
@@ -512,16 +482,103 @@ export default function App() {
         </div>
       </section>
 
-      <section style={S.card} className="cd-card">
-        <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>next 30 days</span></div>
-        <MonthList imminent={imminent} later={later} today={today} onAdd={addMonth} onRemove={removeMonth} onStar={toggleMonthImportant} />
-      </section>
+      <div style={S.grid}>
+        <section style={{ ...S.card, gridColumn: "1 / 2" }} className="cd-card">
+          <div style={S.cardHead}>
+            <h2 style={S.h2}>{isToday ? "Today" : DAYS[(selDate.getDay()+6)%7]}</h2>
+            <span style={S.cardSub}>{selDate.getDate()} {MONTHS[selDate.getMonth()].slice(0,3)} · {dayProgress(selectedDate)}% done</span>
+          </div>
+
+          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onEdit={handleEdit} onDelete={handleDelete} onMove={moveTask} onStar={toggleImportant} />
+
+          <AddRow
+            adding={adding} setAdding={setAdding}
+            onAdd={addTask} onAddRecurring={createRecurrence}
+            selectedDate={selectedDate}
+          />
+        </section>
+
+        <section
+          style={{ ...S.card, ...S.workoutCard }}
+          className="cd-card cd-workout"
+          onClick={() => setFitnessOpen(true)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setFitnessOpen(true); } }}
+        >
+          <div style={S.cardHead}>
+            <h2 style={{ ...S.h2, color: "#fff" }}>Next workout</h2>
+            <span style={S.woOpen}>Fitness ↗</span>
+          </div>
+          {nextWorkout ? (
+            <>
+              <div style={S.woTitle}>{nextWorkout.title}</div>
+              <div style={S.woMeta}>
+                {[
+                  nextWorkout.date === iso(today) ? "Today" : DAYS[(new Date(nextWorkout.date+"T00:00:00").getDay()+6)%7],
+                  nextWorkout.start && (nextWorkout.end ? `${nextWorkout.start}–${nextWorkout.end}` : nextWorkout.start),
+                  taskDuration(nextWorkout) && fmtRange(taskDuration(nextWorkout)),
+                  nextWorkout.tss && `${nextWorkout.tss} TSS`,
+                ].filter(Boolean).join(" · ")}
+              </div>
+              {nextWorkout.note && <div style={S.woNote}>{nextWorkout.note}</div>}
+              {nextFuel && (
+                <div style={S.woFuel}>
+                  <div style={S.woFuelHead}>
+                    Fuelling · {nextFuel.rate} g/h{nextFuel.hard ? " (hard)" : ""} · ~{nextFuel.delivered} g carbs
+                    {nextFuel.capped ? " · capped" : ""}
+                  </div>
+                  <div style={S.woFuelChips}>
+                    <FuelChip icon="🥤" n={nextFuel.bottles} label="Bottles" />
+                    <FuelChip icon="🍬" n={nextFuel.gels} label="Gels" />
+                    <FuelChip icon="🍫" n={nextFuel.bars} label="Bar" />
+                  </div>
+                </div>
+              )}
+            </>
+          ) : <div style={{ ...S.empty, color: "rgba(255,255,255,0.8)" }}>No upcoming training scheduled.</div>}
+        </section>
+      </div>
+
+      <div style={S.grid}>
+        <section style={S.card} className="cd-card">
+          <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>next 30 days</span></div>
+          <MonthList imminent={imminent} later={later} today={today} onAdd={addTask} onRemove={removeTask} onStar={toggleImportant} onShare={toggleShared} />
+        </section>
+
+        <section style={S.card} className="cd-card">
+          <div style={S.cardHead}>
+            <h2 style={S.h2}>{weather?.place || "Bergen"}</h2>
+            <span style={S.cardSub}>{weather ? "Live from YR.no" : "Loading…"}</span>
+          </div>
+          {weather?.days?.length ? (
+            <>
+              <div style={S.wxRow}>
+                {weather.days.map((w) => {
+                  const open = w.date === openWeatherDate;
+                  return (
+                    <button key={w.date} onClick={() => setOpenWeatherDate(open ? null : w.date)}
+                      style={{ ...S.wxDay, ...(open ? S.wxDayActive : {}) }} className="cd-weekday">
+                      <div style={S.wxName}>{w.d}</div>
+                      <div style={S.wxIcon}>{w.icon}</div>
+                      <div style={S.wxHi}>{w.hi}°</div>
+                      <div style={S.wxLo}>{w.lo}°</div>
+                      <div style={S.wxPop}>{w.pop}%</div>
+                    </button>
+                  );
+                })}
+              </div>
+              <WeatherDetail day={weather.days.find(d => d.date === openWeatherDate)} />
+            </>
+          ) : <div style={S.empty}>Weather unavailable.</div>}
+        </section>
+      </div>
 
       <footer style={S.footer}>
         v2 · everything synced via your home server · refreshes every 5 min
       </footer>
 
-      {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} upcoming={upcomingTraining} today={today} onClose={() => setFitnessOpen(false)} />}
+      {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} upcoming={upcomingTraining} today={today} profile={profile} onClose={() => setFitnessOpen(false)} />}
       {calendarOpen && (
         <CalendarOverlay
           selectedDate={selectedDate} today={today}
@@ -540,6 +597,13 @@ export default function App() {
           onAll={() => applyScope("all")}
           onClose={() => setScopePrompt(null)}
         />
+      )}
+      {toast && (
+        <div style={S.toast} className="cd-toast" role="status">
+          <span style={S.toastMsg}>{toast.msg}</span>
+          {toast.onUndo && <button style={S.toastUndo} className="cd-toast-undo" onClick={toast.onUndo}>↩ Undo</button>}
+          <button style={S.toastClose} onClick={dismissToast} aria-label="Dismiss">×</button>
+        </div>
       )}
     </div>
   );
@@ -573,7 +637,7 @@ const formBand = (f) => {
   return { label: "Fatigued", color: "#d96a8a" };
 };
 
-function FitnessOverlay({ nextWorkout, upcoming, today, onClose }) {
+function FitnessOverlay({ nextWorkout, upcoming, today, profile, onClose }) {
   const [data, setData] = useState(null);
   const [state, setState] = useState("loading"); // loading | ready | error
   const [err, setErr] = useState("");
@@ -583,7 +647,7 @@ function FitnessOverlay({ nextWorkout, upcoming, today, onClose }) {
     let alive = true;
     (async () => {
       try {
-        const res = await fetch("/api/fitness");
+        const res = await fetch(`/api/fitness?profile=${profile}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const j = await res.json();
         if (alive) { setData(j); setState("ready"); }
@@ -592,7 +656,7 @@ function FitnessOverlay({ nextWorkout, upcoming, today, onClose }) {
       }
     })();
     return () => { alive = false; };
-  }, []);
+  }, [profile]);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -893,7 +957,6 @@ function CalendarOverlay({ selectedDate, today, onPick, onClose }) {
         (d.tasks || []).forEach((t) => push(t.date, t.cat));
         (d.birthdays || []).forEach((t) => push(t.date, "birthday"));
         (d.localTasks || []).forEach((t) => push(t.date, t.cat));
-        (d.month || []).forEach((m) => push(m.date, m.cat));
         setByDay(map); setLoading(false);
       })
       .catch(() => { if (alive) { setByDay({}); setLoading(false); } });
@@ -947,7 +1010,7 @@ function CalendarOverlay({ selectedDate, today, onPick, onClose }) {
   );
 }
 
-function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove }) {
+function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove, onStar }) {
   if (!tasks.length) {
     return <div style={S.tlEmpty}>Nothing scheduled. Tap <b>+ Add block</b> to shape your day.</div>;
   }
@@ -991,7 +1054,8 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove }) {
         // Overdue: today, not done, its time has passed. Only local tasks can be rescheduled.
         const endMin = end ?? start;
         const overdue = isToday && !t.done && endMin != null && nowMin > endMin;
-        const canPush = overdue && t.id.startsWith("local:");
+        const stored = isStored(t.id);
+        const canPush = overdue && stored;
 
         return (
           <div key={t.id} style={S.tlRow} className="cd-row">
@@ -1030,15 +1094,20 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove }) {
                     ? <div style={S.tlRemaining}>{end - nowMin} min remaining</div>
                     : (t.note ? <div style={S.tlNote}>{t.note}</div> : null)}
                   {!inProgress && (
-                    <span style={{ ...S.tag, color: c.dot }}>{c.label}{t.recurring ? " · ↻" : ""}</span>
+                    <span style={{ ...S.tag, color: c.dot }}>{c.label}{t.important ? " · ★" : ""}{t.recurring ? " · ↻" : ""}{t.shared ? " · 🔗" : ""}</span>
                   )}
                 </div>
               </button>
               {canPush && <PushBar taskDate={t.date} onMove={(d) => onMove(t.id, d)} />}
             </div>
 
-            {(t.id.startsWith("local:") || t.recurring) && (
+            {(stored || t.recurring) && (
               <div style={S.tlActions}>
+                {stored && (
+                  <button onClick={() => onStar(t.id, !t.important)} style={{ ...S.actBtn, color: t.important ? "#d4a056" : faint }}
+                    title={t.important ? "Starred — shown in Month ahead. Tap to unstar." : "Star — show in Month ahead"}
+                    className={t.important ? "" : "cd-del"}>{t.important ? "★" : "☆"}</button>
+                )}
                 <button onClick={() => onEdit(t)} style={S.actBtn} title="Edit" className="cd-del">✎</button>
                 <button onClick={() => onDelete(t)} style={S.actBtn} title={t.recurring ? "Delete (repeating)" : "Delete"} className="cd-del">×</button>
               </div>
@@ -1089,6 +1158,8 @@ function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
   const [endMode, setEndMode] = useState("never");
   const [until, setUntil] = useState("");
   const [count, setCount] = useState("");
+  const [shared, setShared] = useState(false);
+  const [important, setImportant] = useState(false);
 
   if (!adding) {
     return <button style={S.addBtn} onClick={() => setAdding(true)} className="cd-add">+ Add block</button>;
@@ -1098,13 +1169,13 @@ function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
   const unit = freq === "daily" ? "day(s)" : freq === "weekly" ? "week(s)" : "month(s)";
   const invalidEnd = freq !== "none" && ((endMode === "until" && !until) || (endMode === "count" && !count));
 
-  const reset = () => { setTitle(""); setEnd(""); setNote(""); setTss(""); setFreq("none"); setIntervalN(1); setEndMode("never"); setUntil(""); setCount(""); setAdding(false); };
+  const reset = () => { setTitle(""); setEnd(""); setNote(""); setTss(""); setFreq("none"); setIntervalN(1); setEndMode("never"); setUntil(""); setCount(""); setShared(false); setImportant(false); setAdding(false); };
 
   const submit = () => {
     if (!title.trim()) return;
-    const base = { title: title.trim(), start, end, cat, note: note.trim(), tss: cat === "training" && tss ? Number(tss) : null };
+    const base = { title: title.trim(), start, end, cat, note: note.trim(), shared, tss: cat === "training" && tss ? Number(tss) : null };
     if (freq === "none") {
-      onAdd(base);
+      onAdd({ ...base, important });
     } else {
       onAddRecurring({
         ...base, dtstart: selectedDate, freq, interval: Number(interval) || 1,
@@ -1174,6 +1245,9 @@ function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
         </div>
       )}
 
+      {freq === "none" && <StarToggle important={important} onToggle={() => setImportant((s) => !s)} />}
+      <SharedToggle shared={shared} onToggle={() => setShared((s) => !s)} />
+
       <div style={S.addActions}>
         <button style={S.cancelBtn} onClick={reset}>Cancel</button>
         <button style={S.saveBtn} disabled={!title.trim() || invalidEnd} onClick={submit}>
@@ -1181,6 +1255,28 @@ function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
         </button>
       </div>
     </div>
+  );
+}
+
+// Toggle that stars an item so it surfaces in the "Month ahead" list.
+function StarToggle({ important, onToggle }) {
+  return (
+    <button type="button" onClick={onToggle} aria-pressed={important}
+      style={{ ...S.shareToggle, ...(important ? S.starToggleOn : {}) }}
+      title="Starred events show in the Month-ahead list">
+      <span>{important ? "★" : "☆"}</span>{important ? "Starred — in Month ahead" : "Star (show in Month ahead)"}
+    </button>
+  );
+}
+
+// Toggle that marks an item visible on both household decks.
+function SharedToggle({ shared, onToggle }) {
+  return (
+    <button type="button" onClick={onToggle} aria-pressed={shared}
+      style={{ ...S.shareToggle, ...(shared ? S.shareToggleOn : {}) }}
+      title="Shared events show on both Berge's and Amanda's deck">
+      <span>🔗</span>{shared ? "Shared with both decks" : "Make shared (both decks)"}
+    </button>
   );
 }
 
@@ -1219,6 +1315,8 @@ function EditModal({ task, onSave, onClose }) {
   const [cat, setCat] = useState(task.cat || "work");
   const [note, setNote] = useState(task.note || "");
   const [tss, setTss] = useState(task.tss ? String(task.tss) : "");
+  const [shared, setShared] = useState(!!task.shared);
+  const [important, setImportant] = useState(!!task.important);
 
   useEffect(() => {
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
@@ -1228,7 +1326,10 @@ function EditModal({ task, onSave, onClose }) {
 
   const save = () => {
     if (!title.trim()) return;
-    onSave({ title: title.trim(), start, end, cat, note: note.trim(), sport: task.sport || "", tss: cat === "training" && tss ? Number(tss) : null });
+    const fields = { title: title.trim(), start, end, cat, note: note.trim(), sport: task.sport || "", shared, tss: cat === "training" && tss ? Number(tss) : null };
+    // Repeating series have no per-instance star; only stored one-off tasks do.
+    if (!task.recurring) fields.important = important;
+    onSave(fields);
   };
 
   return (
@@ -1259,6 +1360,8 @@ function EditModal({ task, onSave, onClose }) {
               </button>
             ))}
           </div>
+          {!task.recurring && <StarToggle important={important} onToggle={() => setImportant((s) => !s)} />}
+          <SharedToggle shared={shared} onToggle={() => setShared((s) => !s)} />
           <div style={S.addActions}>
             <button style={S.cancelBtn} onClick={onClose}>Cancel</button>
             <button style={S.saveBtn} disabled={!title.trim()} onClick={save}>
@@ -1299,13 +1402,14 @@ function WeatherDetail({ day }) {
   );
 }
 
-function MonthList({ imminent, later, today, onAdd, onRemove, onStar }) {
+function MonthList({ imminent, later, today, onAdd, onRemove, onStar, onShare }) {
   const [date, setDate] = useState("");
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [title, setTitle] = useState("");
   const [cat, setCat] = useState("social");
   const [important, setImportant] = useState(true);
+  const [shared, setShared] = useState(false);
   const todayStr = (d => { const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),da=String(d.getDate()).padStart(2,"0"); return `${y}-${m}-${da}`;})(today);
 
   return (
@@ -1316,8 +1420,8 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar }) {
             <div key={m.id} style={S.imminentRow}>
               <span style={S.imminentWhen}>{m.date === todayStr ? "Today" : "Tomorrow"}</span>
               <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
-              <span style={S.imminentTitle}>{m.title}</span>
-              {m.id.startsWith("m:") && (
+              <span style={S.imminentTitle}>{m.shared ? <span title="Shared on both decks">🔗 </span> : null}{m.title}</span>
+              {isStored(m.id) && (
                 <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
               )}
             </div>
@@ -1340,10 +1444,14 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar }) {
               <span style={S.monthTimeCell}>{m.start || ""}</span>
               <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
               <span style={S.monthTitle}>{m.title}</span>
-              {m.id.startsWith("m:")
+              {isStored(m.id)
+                ? <button onClick={() => onShare(m.id, !m.shared)} style={{ ...S.starRow, color: m.shared ? accent : faint }}
+                    title={m.shared ? "Shared on both decks — tap to unshare" : "Share with both decks"}>🔗</button>
+                : <span />}
+              {isStored(m.id)
                 ? <button onClick={() => onStar(m.id, false)} style={S.starRow} title="Unstar — remove from Month ahead">★</button>
                 : <span />}
-              {m.id.startsWith("m:")
+              {isStored(m.id)
                 ? <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
                 : <span />}
             </div>
@@ -1365,8 +1473,14 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar }) {
           style={{ ...S.starBtn, color: important ? "#d4a056" : faint, borderColor: important ? "#e6c98a" : line }}>
           {important ? "★" : "☆"}
         </button>
+        <button
+          onClick={() => setShared(v => !v)}
+          title={shared ? "Shared — shows on both decks" : "Private to this deck"}
+          style={{ ...S.monthShareBtn, ...(shared ? S.monthShareBtnOn : {}) }}>
+          🔗
+        </button>
         <button style={S.saveBtn} disabled={!date || !title.trim()}
-          onClick={() => { if(!date||!title.trim()) return; onAdd({ date, start, end, title:title.trim(), cat, important }); setDate(""); setStart(""); setEnd(""); setTitle(""); setImportant(true); }}>
+          onClick={() => { if(!date||!title.trim()) return; onAdd({ date, start, end, title:title.trim(), cat, important, shared }); setDate(""); setStart(""); setEnd(""); setTitle(""); setImportant(true); setShared(false); }}>
           Add
         </button>
       </div>
@@ -1380,9 +1494,11 @@ const faint = "#a6adba";
 const paper = "#eef1f6";
 const cardBg = "#fbfcfe";
 const line = "#dde2ec";
-const accent = "#2f5d9e";
-const accentSoft = "#eef3fa";
-const accentBorder = "#cdddef";
+// These resolve against the CSS variables published by the active profile
+// (see themeVars), so every accent-colored element re-themes on profile switch.
+const accent = "var(--accent)";
+const accentSoft = "var(--accent-soft)";
+const accentBorder = "var(--accent-border)";
 
 // Power-zone palette: cool → warm as intensity climbs.
 const ZONE_COLORS = ["#9fb6cf", "#6f9e6a", "#5b96cf", "#2f5d9e", "#d4a056", "#d98a5a", "#d96a8a"];
@@ -1404,15 +1520,18 @@ const globalCss = `
   @keyframes ovFade { from { opacity:0; } to { opacity:1; } }
   @keyframes ovSlide { from { opacity:0; transform: translateY(24px) scale(.98); } to { opacity:1; transform:none; } }
   .cd-workout { cursor: pointer; }
-  .cd-workout:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px rgba(36,75,128,0.7); }
+  .cd-workout:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px var(--accent-glow); }
   .cd-ov-backdrop { animation: ovFade .2s ease; }
   .cd-ov-panel { animation: ovSlide .28s cubic-bezier(.2,.8,.25,1); }
   .cd-ov-close:hover { background: ${line}; color: ${ink}; }
-  .cd-ov-box:hover { transform: translateY(-2px); border-color: ${accentBorder}; box-shadow: 0 12px 26px -18px rgba(47,93,158,0.6); }
+  .cd-ov-box:hover { transform: translateY(-2px); border-color: var(--accent-border); box-shadow: 0 12px 26px -18px var(--accent-glow); }
   @keyframes badgePulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
   .cd-badge-live { animation: badgePulse 2.4s ease-in-out infinite; }
-  .cd-push:hover { background: ${accentBorder}; }
-  .cd-cal-cell:hover { border-color: ${accent}; }
+  .cd-push:hover { background: var(--accent-border); }
+  .cd-cal-cell:hover { border-color: var(--accent); }
+  @keyframes toastUp { from { opacity:0; transform: translate(-50%, 16px); } to { opacity:1; transform: translate(-50%, 0); } }
+  .cd-toast { animation: toastUp .25s cubic-bezier(.2,.8,.25,1); }
+  .cd-toast-undo:hover { background: rgba(255,255,255,0.16); }
 `;
 
 const S = {
@@ -1423,14 +1542,31 @@ const S = {
                  background: "#fbeae3", color: "#7a3a1f", fontSize: 12.5, border: "1px solid #f0d4c4" },
   header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 26, maxWidth: 1200, marginInline: "auto" },
   kicker: { textTransform: "uppercase", letterSpacing: "0.22em", fontSize: 11, color: muted, fontWeight: 600 },
+  profileBar: { display: "flex", gap: 6, marginBottom: 8 },
+  profilePill: { padding: "5px 14px", borderRadius: 999, border: `1px solid ${line}`, background: cardBg, color: muted,
+    fontSize: 12.5, fontWeight: 600, letterSpacing: "0.02em", cursor: "pointer", fontFamily: "inherit", transition: "all .18s ease" },
+  shareToggle: { display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "9px 12px", borderRadius: 12,
+    border: `1px dashed ${line}`, background: "transparent", color: muted, fontSize: 13, fontWeight: 600,
+    fontFamily: "inherit", cursor: "pointer", transition: "all .18s ease" },
+  shareToggleOn: { borderStyle: "solid", borderColor: accentBorder, background: accentSoft, color: accent },
+  starToggleOn: { borderStyle: "solid", borderColor: "#e6c98a", background: "rgba(212,160,86,0.14)", color: "#a8761c" },
+  toast: { position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)", zIndex: 200,
+    display: "flex", alignItems: "center", gap: 14, background: ink, color: "#fff",
+    padding: "11px 12px 11px 18px", borderRadius: 14, boxShadow: "0 18px 44px -16px rgba(0,0,0,0.55)",
+    fontSize: 14, fontWeight: 500, maxWidth: "min(92vw, 460px)" },
+  toastMsg: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  toastUndo: { background: "transparent", border: "1px solid rgba(255,255,255,0.4)", color: "#fff",
+    fontWeight: 700, fontSize: 13, padding: "5px 12px", borderRadius: 9, cursor: "pointer", fontFamily: "inherit", flex: "0 0 auto" },
+  toastClose: { background: "transparent", border: "none", color: "rgba(255,255,255,0.65)", fontSize: 20,
+    lineHeight: 1, cursor: "pointer", padding: "0 4px", flex: "0 0 auto" },
   h1: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: "clamp(28px,4vw,42px)", margin: "4px 0 0", letterSpacing: "-0.01em", color: ink },
   headerDate: { textAlign: "right" },
   bigDay: { fontFamily: "'Fraunces', serif", fontSize: 40, fontWeight: 700, lineHeight: 1, color: accent },
   bigMonth: { fontSize: 13, color: muted, fontWeight: 500, letterSpacing: "0.04em" },
   grid: { display: "grid", gridTemplateColumns: "minmax(0,1.4fr) minmax(0,1fr)", gap: 18, maxWidth: 1200, marginInline: "auto", marginBottom: 18, alignItems: "start" },
-  rightCol: { display: "flex", flexDirection: "column", gap: 18 },
   card: { background: cardBg, border: `1px solid ${line}`, borderRadius: 22, padding: "20px 22px",
           boxShadow: "0 10px 30px -26px rgba(30,40,70,0.4)", maxWidth: 1200, marginInline: "auto", width: "100%", marginBottom: 0 },
+  weekCard: { marginBottom: 18 },
   cardHead: { display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 16, gap: 12 },
   h2: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: 0, color: ink },
   cardSub: { fontSize: 12.5, color: muted },
@@ -1483,7 +1619,7 @@ const S = {
   addActions: { display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 2 },
   cancelBtn: { padding: "8px 16px", borderRadius: 10, border: `1px solid ${line}`, background: "#fff", color: muted, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   saveBtn: { padding: "8px 18px", borderRadius: 10, border: "none", background: accent, color: "#fff", fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
-  workoutCard: { background: "linear-gradient(135deg, #2f5d9e 0%, #244b80 100%)", border: "none", color: "#fff" },
+  workoutCard: { background: "var(--accent-grad)", border: "none", color: "#fff" },
   woTitle: { fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 600, lineHeight: 1.2 },
   woMeta: { fontSize: 13.5, opacity: 0.85, marginTop: 6, fontWeight: 500 },
   woNote: { fontSize: 13, opacity: 0.92, marginTop: 10, lineHeight: 1.45, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.22)" },
@@ -1655,11 +1791,17 @@ const S = {
   imminentRow: { display: "grid", gridTemplateColumns: "82px 10px 1fr 24px", gap: 12, alignItems: "center" },
   imminentWhen: { fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 700, color: accent, letterSpacing: "0.02em" },
   imminentTitle: { fontSize: 14.5, fontWeight: 600, color: ink },
-  monthList: { display: "flex", flexDirection: "column", gap: 2, marginBottom: 14 },
-  monthItem: { display: "grid", gridTemplateColumns: "44px 42px 10px 1fr 20px 24px", gap: 12, alignItems: "center", padding: "9px 4px", borderBottom: `1px solid ${line}` },
+  monthList: { display: "flex", flexDirection: "column", gap: 2, marginBottom: 14, maxHeight: 260, overflowY: "auto" },
+  monthItem: { display: "grid", gridTemplateColumns: "44px 42px 10px 1fr 20px 20px 24px", gap: 12, alignItems: "center", padding: "9px 4px", borderBottom: `1px solid ${line}` },
   monthTimeCell: { fontSize: 12.5, color: muted, fontWeight: 500, fontVariantNumeric: "tabular-nums", textAlign: "right" },
   starBtn: { width: 38, height: 38, flex: "0 0 auto", borderRadius: 10, border: `1px solid ${line}`, background: "#fff",
              fontSize: 17, lineHeight: 1, cursor: "pointer", fontFamily: "inherit" },
+  // Shared toggle in the month-add row — emoji ignores text color, so on/off is
+  // signalled by a solid accent fill (on) vs a dim dashed chip (off).
+  monthShareBtn: { width: 38, height: 38, flex: "0 0 auto", display: "flex", alignItems: "center", justifyContent: "center",
+    boxSizing: "border-box", borderRadius: 10, cursor: "pointer", fontFamily: "inherit", fontSize: 16,
+    border: `1px dashed ${line}`, background: "#fff", opacity: 0.45 },
+  monthShareBtnOn: { border: "1px solid var(--accent)", background: "var(--accent-soft)", opacity: 1 },
   starRow: { background: "none", border: "none", color: "#d4a056", fontSize: 16, cursor: "pointer", lineHeight: 1, padding: 0 },
   monthDate: { textAlign: "center" },
   monthDay: { fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 700, display: "block", lineHeight: 1, color: accent },

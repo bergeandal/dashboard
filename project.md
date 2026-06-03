@@ -9,7 +9,7 @@ Live at **https://command-deck-berge.fly.dev** (Fly.io, Stockholm region).
 - **Backend**: Node 22 + TypeScript + Fastify, in `server/src/`
 - **Data**: SQLite (better-sqlite3) on a Fly volume mounted at `/app/data/deck.db`
 - **Deploy**: One Docker image (multi-stage: builds frontend, builds server, bundles both),
-  one Fly app `command-deck-berge`, served from a single origin (`/` → React, `/api/*` → Fastify)
+  one Fly app `command-deck-berge`, served from a single origin (`/` → React, `/api/*` → Fastify) (fly deploy)
 - **Repo**: github.com/bergeandal/dashboard, branch `main`
 
 ## Layout
@@ -36,12 +36,12 @@ Dashboard/
 
 ## Data sources
 
-| Source | How | Notes |
-|---|---|---|
-| Google calendars: training, work, social, home, event | Secret `.ics` URLs (read-only, no OAuth) | Env vars `ICS_TRAINING`/`ICS_WORK`/`ICS_SOCIAL`/`ICS_HOME`/`ICS_EVENTS`; Fly secrets in prod |
-| Birthdays (from Google Contacts) | Static file `server/birthdays.ics` bundled into image | Contacts birthdays have no shareable iCal URL on Google's side. Re-export + commit + redeploy to update. |
-| Bergen weather | YR.no `locationforecast/2.0/compact`, server-side | Required `User-Agent` (`YR_USER_AGENT` env). Honors `Expires` header. Bergen lat/lon hardcoded in `.env`. |
-| Dashboard-only tasks, done-state, manual month entries | SQLite on Fly volume | Synced across all devices that hit the URL |
+| Source                                                 | How                                                     | Notes                                                                                                             |
+| ------------------------------------------------------ | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Google calendars: training, work, social, home, event  | Secret `.ics` URLs (read-only, no OAuth)              | Env vars `ICS_TRAINING`/`ICS_WORK`/`ICS_SOCIAL`/`ICS_HOME`/`ICS_EVENTS`; Fly secrets in prod            |
+| Birthdays (from Google Contacts)                       | Static file `server/birthdays.ics` bundled into image | Contacts birthdays have no shareable iCal URL on Google's side. Re-export + commit + redeploy to update.          |
+| Bergen weather                                         | YR.no `locationforecast/2.0/compact`, server-side     | Required `User-Agent` (`YR_USER_AGENT` env). Honors `Expires` header. Bergen lat/lon hardcoded in `.env`. |
+| Dashboard-only tasks, done-state, manual month entries | SQLite on Fly volume                                    | Synced across all devices that hit the URL                                                                        |
 
 ## API surface
 

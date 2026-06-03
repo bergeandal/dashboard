@@ -4,7 +4,7 @@ import fastifyStatic from "@fastify/static";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { config, type Category } from "./config.js";
+import { config, type Category, type ProfileId, isProfile, profileCalendars, intervalsFor } from "./config.js";
 import { fetchAllTasks, fetchBirthdays } from "./calendar/fetch.js";
 import { getWeather } from "./weather/yr.js";
 import { getFitness } from "./fitness/intervals.js";
@@ -39,10 +39,16 @@ const VALID_CATS: Category[] = ["work", "training", "social", "home", "birthday"
 const isCat = (s: unknown): s is Category =>
   typeof s === "string" && (VALID_CATS as string[]).includes(s);
 
+// Active profile from a request (query or body); defaults to the primary profile.
+const reqProfile = (v: unknown): ProfileId => (isProfile(v) ? v : "berge");
+// A row is visible to a profile if it belongs to that profile or is shared.
+const visibleTo = (p: ProfileId) => (r: { profile: string; shared: number }) => r.profile === p || !!r.shared;
+
 app.get("/api/health", async () => ({ ok: true }));
 
 app.get("/api/data", async (req) => {
-  const q = req.query as { start?: string; days?: string };
+  const q = req.query as { start?: string; days?: string; profile?: string };
+  const profile = reqProfile(q.profile);
   const now = new Date();
   const start = parseDate(q.start, now);
   const days = Math.min(Math.max(Number(q.days ?? 60), 7), 120);
@@ -50,7 +56,7 @@ app.get("/api/data", async (req) => {
 
   const birthdaysEnd = new Date(+start + 365 * 24 * 3600 * 1000);
   const [tasks, birthdays, weather] = await Promise.all([
-    fetchAllTasks(start, end),
+    fetchAllTasks(profileCalendars(profile), start, end),
     fetchBirthdays(start, birthdaysEnd),
     getWeather().catch((e) => { app.log.error(e); return null; }),
   ]);
@@ -63,23 +69,22 @@ app.get("/api/data", async (req) => {
     if (!exMap.has(e.series_id)) exMap.set(e.series_id, new Set());
     exMap.get(e.series_id)!.add(e.date);
   }
-  const recurringTasks = dbo.listRecurrences().flatMap((r) => {
+  const recurringTasks = dbo.listRecurrences().filter(visibleTo(profile)).flatMap((r) => {
     const skip = exMap.get(r.id);
     return expandRecurrence(r, winStart, winEnd)
       .filter((date) => !skip?.has(date))
       .map((date) => ({
         id: `rec:${r.id}:${date}`, date, start: r.start, end: r.end,
         title: r.title, cat: r.cat, note: r.note, sport: r.sport, tss: r.tss,
-        recurring: true, seriesId: r.id,
+        recurring: true, seriesId: r.id, shared: r.shared,
       }));
   });
 
   return {
     tasks: [...tasks, ...recurringTasks],
     birthdays,
-    localTasks: dbo.listLocalTasks(),
+    localTasks: dbo.listLocalTasks().filter(visibleTo(profile)),
     doneIds: dbo.listDoneIds(),
-    month: dbo.listMonth(),
     weather,
     fetchedAt: new Date().toISOString(),
   };
@@ -90,7 +95,8 @@ app.get("/api/weather", async () => getWeather());
 // Fitness/health from intervals.icu — fetched lazily by the workout overlay,
 // kept out of /api/data so the main dashboard load stays light.
 app.get("/api/fitness", async (req, reply) => {
-  if (!config.intervals) {
+  const profile = reqProfile((req.query as { profile?: string }).profile);
+  if (!intervalsFor(profile)) {
     reply.code(503);
     return { error: "intervals.icu not configured" };
   }
@@ -116,6 +122,8 @@ app.post("/api/tasks", async (req, reply) => {
     title: String(b.title), cat: b.cat as Category, note: String(b.note ?? ""),
     sport: String(b.sport ?? ""),
     tss: Number.isFinite(tssNum) && tssNum > 0 ? Math.round(tssNum) : null,
+    important: b.important ? 1 : 0,
+    profile: reqProfile(b.profile), shared: b.shared ? 1 : 0,
   };
   dbo.insertLocalTask(task);
   return task;
@@ -130,12 +138,16 @@ app.delete<{ Params: { id: string } }>("/api/tasks/:id", async (req) => {
 app.patch<{ Params: { id: string } }>("/api/tasks/:id", async (req, reply) => {
   const b = req.body as any;
   const { id } = req.params;
-  if (!id.startsWith("local:")) { reply.code(400); return { error: "only local tasks can be edited" }; }
+  // local: (daily blocks) and m: (migrated month-ahead events) are both stored
+  // local tasks now — either can be edited. Calendar/recurring ids cannot.
+  if (!id.startsWith("local:") && !id.startsWith("m:")) { reply.code(400); return { error: "only stored tasks can be edited" }; }
   if (b.cat !== undefined && !isCat(b.cat)) { reply.code(400); return { error: "invalid cat" }; }
   if (b.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(b.date))) { reply.code(400); return { error: "invalid date" }; }
   const partial: Record<string, unknown> = {};
   for (const k of ["date", "start", "end", "title", "cat", "note", "sport"]) if (b[k] !== undefined) partial[k] = String(b[k]);
   if (b.tss !== undefined) { const n = Number(b.tss); partial.tss = Number.isFinite(n) && n > 0 ? Math.round(n) : null; }
+  if (b.important !== undefined) partial.important = b.important ? 1 : 0;
+  if (b.shared !== undefined) partial.shared = b.shared ? 1 : 0;
   if (!Object.keys(partial).length) { reply.code(400); return { error: "no fields to update" }; }
   dbo.updateLocalTask(id, partial);
   return { ok: true };
@@ -149,34 +161,6 @@ app.post<{ Params: { id: string } }>("/api/done/:id", async (req) => {
 
 app.delete<{ Params: { id: string } }>("/api/done/:id", async (req) => {
   dbo.unmarkDone(req.params.id);
-  return { ok: true };
-});
-
-// --- Month-ahead events ---
-app.post("/api/month", async (req, reply) => {
-  const b = req.body as any;
-  if (!b?.date || !b?.title || !isCat(b?.cat)) {
-    reply.code(400); return { error: "date, title, cat required" };
-  }
-  const ev = {
-    id: "m:" + Date.now() + ":" + Math.random().toString(36).slice(2, 8),
-    date: String(b.date), start: String(b.start ?? ""), end: String(b.end ?? ""),
-    title: String(b.title), cat: b.cat as Category,
-    important: b.important === false || b.important === 0 ? 0 : 1,
-  };
-  dbo.insertMonth(ev);
-  return ev;
-});
-
-app.patch<{ Params: { id: string } }>("/api/month/:id", async (req, reply) => {
-  const b = req.body as any;
-  if (typeof b?.important !== "boolean") { reply.code(400); return { error: "important (boolean) required" }; }
-  dbo.setMonthImportant(req.params.id, b.important);
-  return { ok: true };
-});
-
-app.delete<{ Params: { id: string } }>("/api/month/:id", async (req) => {
-  dbo.deleteMonth(req.params.id);
   return { ok: true };
 });
 
@@ -202,6 +186,7 @@ app.post("/api/recurrences", async (req, reply) => {
     endMode: b.endMode as "never" | "until" | "count",
     until: String(b.until ?? ""),
     count: b.endMode === "count" && Number.isFinite(cnt) && cnt > 0 ? Math.round(cnt) : null,
+    profile: reqProfile(b.profile), shared: b.shared ? 1 : 0,
   };
   dbo.insertRecurrence(series);
   return series;
@@ -234,6 +219,7 @@ app.patch<{ Params: { id: string } }>("/api/recurrences/:id", async (req, reply)
   if (b.byweekday !== undefined) partial.byweekday = Array.isArray(b.byweekday) ? b.byweekday.join(",") : String(b.byweekday);
   if (b.tss !== undefined) { const n = Number(b.tss); partial.tss = Number.isFinite(n) && n > 0 ? Math.round(n) : null; }
   if (b.count !== undefined) { const n = Number(b.count); partial.count = Number.isFinite(n) && n > 0 ? Math.round(n) : null; }
+  if (b.shared !== undefined) partial.shared = b.shared ? 1 : 0;
   dbo.updateRecurrence(req.params.id, partial);
   return { ok: true };
 });
@@ -271,6 +257,8 @@ app.post<{ Params: { id: string } }>("/api/recurrences/:id/split", async (req, r
     endMode: carryCount ? ("never" as const) : orig.endMode,
     until: carryCount ? "" : orig.until,
     count: null,
+    profile: orig.profile,
+    shared: b.shared !== undefined ? (b.shared ? 1 : 0) : orig.shared,
   };
   dbo.insertRecurrence(series);
   return series;

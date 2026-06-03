@@ -6,18 +6,18 @@ const CACHE_MS = 5 * 60 * 1000;
 type CacheEntry = { at: number; tasks: Task[] };
 const cache = new Map<string, CacheEntry>();
 
+type CalMap = Partial<Record<Exclude<Category, "birthday">, string>>;
 type Source = { cat: Category; kind: "url" | "file"; value: string };
 
-const sources = (): Source[] => {
-  const urlCats = Object.keys(config.calendars) as Array<Exclude<Category, "birthday">>;
-  return [
-    ...urlCats.map((cat): Source => ({ cat, kind: "url", value: config.calendars[cat] })),
-    { cat: "birthday", kind: "file", value: config.birthdaysFile },
-  ];
-};
+const urlSources = (calendars: CalMap): Source[] =>
+  (Object.keys(calendars) as Array<Exclude<Category, "birthday">>)
+    .filter((cat) => calendars[cat])
+    .map((cat): Source => ({ cat, kind: "url", value: calendars[cat]! }));
 
 async function fetchSource(s: Source, windowStart: Date, windowEnd: Date): Promise<Task[]> {
-  const key = `${s.cat}:${windowStart.toISOString()}:${windowEnd.toISOString()}`;
+  // Key includes the source value so two profiles sharing a category but
+  // pointing at different calendar URLs don't collide in the cache.
+  const key = `${s.cat}:${s.value}:${windowStart.toISOString()}:${windowEnd.toISOString()}`;
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.tasks;
 
@@ -33,18 +33,16 @@ async function fetchSource(s: Source, windowStart: Date, windowEnd: Date): Promi
   }
 }
 
-export async function fetchAllTasks(windowStart: Date, windowEnd: Date): Promise<Task[]> {
+export async function fetchAllTasks(calendars: CalMap, windowStart: Date, windowEnd: Date): Promise<Task[]> {
   const results = await Promise.all(
-    sources()
-      .filter((s) => s.cat !== "birthday")
-      .map((s) => fetchSource(s, windowStart, windowEnd))
+    urlSources(calendars).map((s) => fetchSource(s, windowStart, windowEnd))
   );
   return results.flat().sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
 }
 
 export async function fetchBirthdays(windowStart: Date, windowEnd: Date): Promise<Task[]> {
-  const src = sources().find((s) => s.cat === "birthday");
-  if (!src) return [];
+  const src: Source = { cat: "birthday", kind: "file", value: config.birthdaysFile };
+  if (!src.value) return [];
   // Roll window back 1 day so today's birthday is included regardless of TZ offset.
   const inclusiveStart = new Date(+windowStart - 24 * 3600 * 1000);
   const todayOslo = new Intl.DateTimeFormat("en-GB", {

@@ -21,6 +21,9 @@ db.exec(`
     note       TEXT NOT NULL DEFAULT '',
     sport      TEXT NOT NULL DEFAULT '',
     tss        INTEGER,
+    important  INTEGER NOT NULL DEFAULT 0,
+    profile    TEXT NOT NULL DEFAULT 'berge',
+    shared     INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_local_tasks_date ON local_tasks(date);
@@ -38,6 +41,8 @@ db.exec(`
     title      TEXT NOT NULL,
     cat        TEXT NOT NULL,
     important  INTEGER NOT NULL DEFAULT 1,
+    profile    TEXT NOT NULL DEFAULT 'berge',
+    shared     INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_month_events_date ON month_events(date);
@@ -58,6 +63,8 @@ db.exec(`
     end_mode   TEXT NOT NULL DEFAULT 'never',
     until      TEXT NOT NULL DEFAULT '',
     count      INTEGER,
+    profile    TEXT NOT NULL DEFAULT 'berge',
+    shared     INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
   );
 
@@ -69,21 +76,45 @@ db.exec(`
 `);
 
 // Migrate older DBs that predate added columns (CREATE IF NOT EXISTS won't add columns).
-for (const ddl of ["sport TEXT NOT NULL DEFAULT ''", "tss INTEGER"]) {
+const profileCols = ["profile TEXT NOT NULL DEFAULT 'berge'", "shared INTEGER NOT NULL DEFAULT 0"];
+for (const ddl of ["sport TEXT NOT NULL DEFAULT ''", "tss INTEGER", "important INTEGER NOT NULL DEFAULT 0", ...profileCols]) {
   try { db.exec(`ALTER TABLE local_tasks ADD COLUMN ${ddl}`); } catch { /* already present */ }
 }
-for (const ddl of ["start TEXT NOT NULL DEFAULT ''", `"end" TEXT NOT NULL DEFAULT ''`, "important INTEGER NOT NULL DEFAULT 1"]) {
+for (const ddl of ["start TEXT NOT NULL DEFAULT ''", `"end" TEXT NOT NULL DEFAULT ''`, "important INTEGER NOT NULL DEFAULT 1", ...profileCols]) {
   try { db.exec(`ALTER TABLE month_events ADD COLUMN ${ddl}`); } catch { /* already present */ }
+}
+for (const ddl of profileCols) {
+  try { db.exec(`ALTER TABLE recurrences ADD COLUMN ${ddl}`); } catch { /* already present */ }
+}
+
+// One-time merge: month-ahead events and daily blocks are now one concept, so
+// fold any existing month_events into local_tasks (keeping their ids so done-
+// state survives) and empty the old table. Idempotent — a no-op once drained.
+{
+  const monthRows = db.prepare(
+    `SELECT id, date, start, "end" as end, title, cat, important, profile, shared, created_at FROM month_events`
+  ).all() as Array<{
+    id: string; date: string; start: string; end: string; title: string;
+    cat: string; important: number; profile: string; shared: number; created_at: number;
+  }>;
+  if (monthRows.length) {
+    const ins = db.prepare(
+      `INSERT OR IGNORE INTO local_tasks (id, date, start, "end", title, cat, note, sport, tss, important, profile, shared, created_at)
+       VALUES (@id, @date, @start, @end, @title, @cat, '', '', NULL, @important, @profile, @shared, @created_at)`
+    );
+    const drain = db.transaction(() => {
+      for (const r of monthRows) ins.run(r);
+      db.prepare(`DELETE FROM month_events`).run();
+    });
+    drain();
+  }
 }
 
 export type LocalTask = {
   id: string; date: string; start: string; end: string;
   title: string; cat: Category; note: string;
-  sport: string; tss: number | null;
-};
-
-export type MonthEvent = {
-  id: string; date: string; start: string; end: string; title: string; cat: Category; important: number;
+  sport: string; tss: number | null; important: number;
+  profile: string; shared: number;
 };
 
 export type Recurrence = {
@@ -91,15 +122,16 @@ export type Recurrence = {
   start: string; end: string; dtstart: string;
   freq: "daily" | "weekly" | "monthly"; interval: number; byweekday: string;
   endMode: "never" | "until" | "count"; until: string; count: number | null;
+  profile: string; shared: number;
 };
 
 const stmts = {
   listLocalTasks: db.prepare<[], LocalTask>(
-    `SELECT id, date, start, "end" as end, title, cat, note, sport, tss FROM local_tasks ORDER BY date, start`
+    `SELECT id, date, start, "end" as end, title, cat, note, sport, tss, important, profile, shared FROM local_tasks ORDER BY date, start`
   ),
   insertLocalTask: db.prepare<LocalTask & { created_at: number }>(
-    `INSERT INTO local_tasks (id, date, start, "end", title, cat, note, sport, tss, created_at)
-     VALUES (@id, @date, @start, @end, @title, @cat, @note, @sport, @tss, @created_at)`
+    `INSERT INTO local_tasks (id, date, start, "end", title, cat, note, sport, tss, important, profile, shared, created_at)
+     VALUES (@id, @date, @start, @end, @title, @cat, @note, @sport, @tss, @important, @profile, @shared, @created_at)`
   ),
   deleteLocalTask: db.prepare<[string]>(`DELETE FROM local_tasks WHERE id = ?`),
   moveLocalTask: db.prepare<[string, string]>(`UPDATE local_tasks SET date = ? WHERE id = ?`),
@@ -110,31 +142,21 @@ const stmts = {
   ),
   unmarkDone: db.prepare<[string]>(`DELETE FROM done WHERE task_id = ?`),
 
-  listMonth: db.prepare<[], MonthEvent>(
-    `SELECT id, date, start, "end" as end, title, cat, important FROM month_events ORDER BY date, start`
-  ),
-  insertMonth: db.prepare<MonthEvent & { created_at: number }>(
-    `INSERT INTO month_events (id, date, start, "end", title, cat, important, created_at)
-     VALUES (@id, @date, @start, @end, @title, @cat, @important, @created_at)`
-  ),
-  setMonthImportant: db.prepare<[number, string]>(`UPDATE month_events SET important = ? WHERE id = ?`),
-  deleteMonth: db.prepare<[string]>(`DELETE FROM month_events WHERE id = ?`),
-
   listRecurrences: db.prepare<[], Recurrence>(
     `SELECT id, title, cat, note, sport, tss, start, "end" as end, dtstart,
-            freq, interval, byweekday, end_mode as endMode, until, count
+            freq, interval, byweekday, end_mode as endMode, until, count, profile, shared
      FROM recurrences`
   ),
   getRecurrence: db.prepare<[string], Recurrence>(
     `SELECT id, title, cat, note, sport, tss, start, "end" as end, dtstart,
-            freq, interval, byweekday, end_mode as endMode, until, count
+            freq, interval, byweekday, end_mode as endMode, until, count, profile, shared
      FROM recurrences WHERE id = ?`
   ),
   insertRecurrence: db.prepare<Recurrence & { created_at: number }>(
     `INSERT INTO recurrences (id, title, cat, note, sport, tss, start, "end", dtstart,
-                              freq, interval, byweekday, end_mode, until, count, created_at)
+                              freq, interval, byweekday, end_mode, until, count, profile, shared, created_at)
      VALUES (@id, @title, @cat, @note, @sport, @tss, @start, @end, @dtstart,
-             @freq, @interval, @byweekday, @endMode, @until, @count, @created_at)`
+             @freq, @interval, @byweekday, @endMode, @until, @count, @profile, @shared, @created_at)`
   ),
   deleteRecurrence: db.prepare<[string]>(`DELETE FROM recurrences WHERE id = ?`),
   listExceptions: db.prepare<[], { series_id: string; date: string }>(
@@ -150,11 +172,12 @@ const stmts = {
 // provided & whitelisted keys are written.
 const LOCAL_COLS: Record<string, string> = {
   date: "date", start: "start", end: '"end"', title: "title", cat: "cat", note: "note", sport: "sport", tss: "tss",
+  important: "important", profile: "profile", shared: "shared",
 };
 const REC_COLS: Record<string, string> = {
   title: "title", cat: "cat", note: "note", sport: "sport", tss: "tss", start: "start", end: '"end"',
   dtstart: "dtstart", freq: "freq", interval: "interval", byweekday: "byweekday",
-  endMode: "end_mode", until: "until", count: "count",
+  endMode: "end_mode", until: "until", count: "count", profile: "profile", shared: "shared",
 };
 function updateRow(table: string, cols: Record<string, string>, id: string, partial: Record<string, unknown>) {
   const keys = Object.keys(partial).filter((k) => k in cols);
@@ -175,11 +198,6 @@ export const dbo = {
   listDoneIds: (): string[] => stmts.listDone.all().map((r) => r.task_id),
   markDone: (id: string) => stmts.markDone.run(id, Date.now()),
   unmarkDone: (id: string) => stmts.unmarkDone.run(id),
-
-  listMonth: (): MonthEvent[] => stmts.listMonth.all(),
-  insertMonth: (e: MonthEvent) => stmts.insertMonth.run({ ...e, created_at: Date.now() }),
-  setMonthImportant: (id: string, important: boolean) => stmts.setMonthImportant.run(important ? 1 : 0, id),
-  deleteMonth: (id: string) => stmts.deleteMonth.run(id),
 
   listRecurrences: (): Recurrence[] => stmts.listRecurrences.all(),
   getRecurrence: (id: string): Recurrence | undefined => stmts.getRecurrence.get(id),
