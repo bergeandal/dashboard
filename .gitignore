@@ -22,3 +22,10 @@ npm-debug.log*
 
 # Claude internal state (do not push)
 .claude/
+
+# Screenshots / scratch images (kept out of source history)
+command-deck/src/image/
+image/
+
+# Personal scratch notes
+notes.md

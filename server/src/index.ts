@@ -10,10 +10,30 @@ import { getWeather } from "./weather/yr.js";
 import { getFitness } from "./fitness/intervals.js";
 import { expandRecurrence } from "./recurrence.js";
 import { dbo } from "./db.js";
+import { authEnabled, COOKIE, COOKIE_MAX_AGE, issueToken, verifyToken, checkPasscode, parseCookie } from "./auth.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ logger: { level: "info" } });
-await app.register(cors, { origin: true });
+await app.register(cors, { origin: true, credentials: true });
+
+// Trusted-device gate: every /api/* call (except the gate itself + health)
+// needs a valid auth cookie. Static SPA assets stay open so the login screen
+// can load. No-op when DECK_PASSCODE is unset (local dev).
+const OPEN_API = new Set(["/api/login", "/api/logout", "/api/health"]);
+app.addHook("onRequest", async (req, reply) => {
+  if (!authEnabled) return;
+  const path = req.url.split("?")[0];
+  if (!path.startsWith("/api/")) return;      // SPA + assets served openly
+  if (OPEN_API.has(path)) return;
+  if (verifyToken(parseCookie(req.headers.cookie, COOKIE))) return;
+  return reply.code(401).send({ error: "unauthorized" });
+});
+
+const setAuthCookie = (req: { headers: Record<string, unknown> }, reply: { header: (k: string, v: string) => void }, value: string, maxAge: number) => {
+  const secure = req.headers["x-forwarded-proto"] === "https";
+  reply.header("Set-Cookie",
+    `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? "; Secure" : ""}`);
+};
 
 const publicDir = join(__dirname, "..", "public");
 if (existsSync(publicDir)) {
@@ -45,6 +65,19 @@ const reqProfile = (v: unknown): ProfileId => (isProfile(v) ? v : "berge");
 const visibleTo = (p: ProfileId) => (r: { profile: string; shared: number }) => r.profile === p || !!r.shared;
 
 app.get("/api/health", async () => ({ ok: true }));
+
+// --- Auth (trusted device) ---
+app.post("/api/login", async (req, reply) => {
+  const b = req.body as { passcode?: unknown };
+  if (!checkPasscode(b?.passcode)) { reply.code(401); return { error: "wrong passcode" }; }
+  setAuthCookie(req, reply, issueToken(), COOKIE_MAX_AGE);
+  return { ok: true };
+});
+
+app.post("/api/logout", async (req, reply) => {
+  setAuthCookie(req, reply, "", 0);
+  return { ok: true };
+});
 
 app.get("/api/data", async (req) => {
   const q = req.query as { start?: string; days?: string; profile?: string };

@@ -21,13 +21,15 @@ const PROFILE_IDS = ["berge", "amanda"];
 // Each profile carries a full accent palette; the active one is published as
 // CSS variables on the shell so the whole page re-themes on switch.
 const PROFILES = {
-  berge:  { name: "Berge",  color: "#2f5d9e", soft: "#eef3fa", border: "#cdddef", grad: "linear-gradient(135deg, #2f5d9e 0%, #244b80 100%)", glow: "rgba(36,75,128,0.7)" },
-  amanda: { name: "Amanda", color: "#b5547e", soft: "#fbeef4", border: "#edccda", grad: "linear-gradient(135deg, #b5547e 0%, #8f3f63 100%)", glow: "rgba(143,63,99,0.7)" },
+  berge:  { name: "Berge",  color: "#2f5d9e", soft: "#eef3fa", border: "#cdddef", grad: "linear-gradient(135deg, #2f5d9e 0%, #244b80 100%)", glow: "rgba(36,75,128,0.7)",
+            bg: "radial-gradient(120% 80% at 0% 0%, #f4f7fc 0%, #eef1f6 55%, #e7ecf5 100%)" },
+  amanda: { name: "Amanda", color: "#b5547e", soft: "#fbeef4", border: "#edccda", grad: "linear-gradient(135deg, #b5547e 0%, #8f3f63 100%)", glow: "rgba(143,63,99,0.7)",
+            bg: "radial-gradient(120% 80% at 0% 0%, #fdf4f8 0%, #f9eaf1 55%, #f1dde7 100%)" },
 };
 const profileOf = (p) => PROFILES[p] || PROFILES.berge;
 const themeVars = (p) => {
   const t = profileOf(p);
-  return { "--accent": t.color, "--accent-soft": t.soft, "--accent-border": t.border, "--accent-grad": t.grad, "--accent-glow": t.glow };
+  return { "--accent": t.color, "--accent-soft": t.soft, "--accent-border": t.border, "--accent-grad": t.grad, "--accent-glow": t.glow, "--app-bg": t.bg };
 };
 
 const stripBursdag = (s) => s.replace(/\s*sin\s+bursdag\s*$/i, "").trim();
@@ -175,10 +177,11 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  const fetchData = useCallback(async () => {
+  const fetchData = useCallback(async (overrideProfile) => {
     try {
       const start = iso(today);
-      const res = await fetch(`/api/data?start=${start}&days=120&profile=${profile}`);
+      const res = await fetch(`/api/data?start=${start}&days=120&profile=${overrideProfile || profile}`);
+      if (res.status === 401) { setStatus("auth"); return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCalendarTasks(data.tasks || []);
@@ -193,6 +196,21 @@ export default function App() {
       setError(String(e.message || e));
     }
   }, [today, profile]);
+
+  // Trusted-device login: enter the shared passcode once + pick who this device
+  // belongs to. On success the server sets a long-lived cookie and the chosen
+  // profile becomes this device's default. Returns false on a bad passcode.
+  const login = useCallback(async (passcode, chosenProfile) => {
+    const res = await fetch("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      credentials: "include", body: JSON.stringify({ passcode }),
+    });
+    if (!res.ok) return false;
+    if (PROFILE_IDS.includes(chosenProfile)) { localStorage.setItem("cd.profile", chosenProfile); setProfile(chosenProfile); }
+    setStatus("loading");
+    fetchData(chosenProfile);
+    return true;
+  }, [fetchData]);
 
   useEffect(() => {
     fetchData();
@@ -334,20 +352,30 @@ export default function App() {
 
   // Star (★) = surface in Month ahead. Shared = show on both decks. Both are
   // just fields on the unified store, patched on the task itself.
+  const patchTask = (id, body, warn) => {
+    setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, ...body } : t));
+    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }).catch((e) => console.warn(warn, e));
+  };
+
   const toggleImportant = (id, important) => {
     if (!isStored(id)) return;
-    setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, important: important ? 1 : 0 } : t));
-    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
-      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ important }),
-    }).catch((e) => console.warn("star failed", e));
+    patchTask(id, { important: important ? 1 : 0 }, "star failed");
+    // Unstarring removes it from Month ahead — offer a one-tap regret.
+    if (!important) {
+      const t = localTasks.find((x) => x.id === id);
+      showToast(`Removed “${t?.title ?? "event"}” from Month ahead`, () => { dismissToast(); patchTask(id, { important: 1 }, "restar failed"); });
+    }
   };
 
   const toggleShared = (id, shared) => {
     if (!isStored(id)) return;
-    setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, shared: shared ? 1 : 0 } : t));
-    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
-      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shared }),
-    }).catch((e) => console.warn("share toggle failed", e));
+    patchTask(id, { shared: shared ? 1 : 0 }, "share toggle failed");
+    if (!shared) {
+      const t = localTasks.find((x) => x.id === id);
+      showToast(`Unshared “${t?.title ?? "event"}” from both decks`, () => { dismissToast(); patchTask(id, { shared: 1 }, "reshare failed"); });
+    }
   };
 
   const dayTasks = (dateStr) =>
@@ -414,6 +442,10 @@ export default function App() {
 
   if (status === "loading") {
     return <div style={{ ...S.shell, ...themeVars(profile) }}><style>{globalCss}</style><div style={S.loading}>Connecting to Command Deck…</div></div>;
+  }
+
+  if (status === "auth") {
+    return <LoginScreen profile={profile} onLogin={login} />;
   }
 
   const dayProgress = (dateStr) => {
@@ -489,7 +521,7 @@ export default function App() {
             <span style={S.cardSub}>{selDate.getDate()} {MONTHS[selDate.getMonth()].slice(0,3)} · {dayProgress(selectedDate)}% done</span>
           </div>
 
-          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onEdit={handleEdit} onDelete={handleDelete} onMove={moveTask} onStar={toggleImportant} />
+          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onEdit={handleEdit} onMove={moveTask} />
 
           <AddRow
             adding={adding} setAdding={setAdding}
@@ -581,13 +613,13 @@ export default function App() {
       {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} upcoming={upcomingTraining} today={today} profile={profile} onClose={() => setFitnessOpen(false)} />}
       {calendarOpen && (
         <CalendarOverlay
-          selectedDate={selectedDate} today={today}
+          selectedDate={selectedDate} today={today} profile={profile}
           onPick={(ds) => { setSelectedDate(ds); setCalendarOpen(false); }}
           onClose={() => setCalendarOpen(false)}
         />
       )}
       {editTask && (
-        <EditModal task={editTask} onSave={saveEdit} onClose={() => setEditTask(null)} />
+        <EditModal task={editTask} onSave={saveEdit} onDelete={() => { const t = editTask; setEditTask(null); handleDelete(t); }} onClose={() => setEditTask(null)} />
       )}
       {scopePrompt && (
         <ScopePopup
@@ -926,7 +958,51 @@ function RecoveryChart({ series }) {
   );
 }
 
-function CalendarOverlay({ selectedDate, today, onPick, onClose }) {
+function LoginScreen({ profile, onLogin }) {
+  const [who, setWho] = useState(PROFILE_IDS.includes(profile) ? profile : "berge");
+  const [code, setCode] = useState("");
+  const [err, setErr] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    if (e) e.preventDefault();
+    if (!code || busy) return;
+    setBusy(true); setErr(false);
+    const ok = await onLogin(code, who);
+    if (!ok) { setErr(true); setBusy(false); setCode(""); }
+  };
+
+  return (
+    <div style={{ ...S.shell, ...themeVars(who), display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <style>{globalCss}</style>
+      <form onSubmit={submit} style={S.loginCard}>
+        <div style={S.loginKicker}>Command Deck</div>
+        <h1 style={S.loginTitle}>Trust this device</h1>
+        <p style={S.loginSub}>Pick who’s using it, then enter the passcode once. This device stays signed in.</p>
+        <div style={S.loginPills}>
+          {PROFILE_IDS.map((id) => {
+            const on = who === id;
+            return (
+              <button type="button" key={id} onClick={() => setWho(id)} aria-pressed={on}
+                style={{ ...S.loginPill, ...(on ? { background: profileOf(id).color, color: "#fff", borderColor: profileOf(id).color } : {}) }}>
+                {profileOf(id).name}
+              </button>
+            );
+          })}
+        </div>
+        <input type="password" autoFocus value={code} aria-label="Passcode"
+          onChange={(e) => { setCode(e.target.value); setErr(false); }}
+          placeholder="Passcode" style={{ ...S.input, ...(err ? S.loginInputErr : {}) }} />
+        {err && <div style={S.loginErr}>Wrong passcode — try again.</div>}
+        <button type="submit" disabled={!code || busy} style={{ ...S.loginBtn, opacity: !code || busy ? 0.6 : 1 }}>
+          {busy ? "Checking…" : `Enter as ${profileOf(who).name}`}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function CalendarOverlay({ selectedDate, today, profile, onPick, onClose }) {
   const [viewMonth, setViewMonth] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
   const [byDay, setByDay] = useState({});
   const [loading, setLoading] = useState(true);
@@ -948,7 +1024,7 @@ function CalendarOverlay({ selectedDate, today, onPick, onClose }) {
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    fetch(`/api/data?start=${iso(gridStart)}&days=42`)
+    fetch(`/api/data?start=${iso(gridStart)}&days=42&profile=${profile}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((d) => {
         if (!alive) return;
@@ -961,7 +1037,7 @@ function CalendarOverlay({ selectedDate, today, onPick, onClose }) {
       })
       .catch(() => { if (alive) { setByDay({}); setLoading(false); } });
     return () => { alive = false; };
-  }, [gridStart]);
+  }, [gridStart, profile]);
 
   const cells = Array.from({ length: 42 }, (_, i) => addDays(gridStart, i));
   const todayStr = iso(today);
@@ -1010,7 +1086,7 @@ function CalendarOverlay({ selectedDate, today, onPick, onClose }) {
   );
 }
 
-function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove, onStar }) {
+function Timeline({ tasks, isToday, now, onToggle, onEdit, onMove }) {
   if (!tasks.length) {
     return <div style={S.tlEmpty}>Nothing scheduled. Tap <b>+ Add block</b> to shape your day.</div>;
   }
@@ -1056,6 +1132,7 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove, onS
         const overdue = isToday && !t.done && endMin != null && nowMin > endMin;
         const stored = isStored(t.id);
         const canPush = overdue && stored;
+        const editable = stored || t.recurring;
 
         return (
           <div key={t.id} style={S.tlRow} className="cd-row">
@@ -1078,17 +1155,15 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove, onS
 
             <div style={S.tlBlockCol}>
               <button
-                onClick={() => onToggle(t.id)}
+                onClick={() => editable ? onEdit(t) : onToggle(t.id)}
                 style={{ ...S.tlBlock, ...(inProgress ? S.tlBlockActive : {}), ...(overdue ? S.tlBlockOverdue : {}), opacity: t.done ? 0.62 : 1 }}
                 className="cd-block"
+                title={editable ? "Tap to edit" : "Tap to mark done"}
               >
                 {inProgress && <div style={{ ...S.tlFill, width: `${Math.round(progress * 100)}%`, background: c.soft }} />}
                 <div style={S.tlBlockInner}>
                   <div style={S.tlBlockTop}>
                     <span style={{ ...S.tlTitle, textDecoration: t.done ? "line-through" : "none" }}>{t.title}</span>
-                    <span style={{ ...S.check, borderColor: c.dot, background: t.done ? c.dot : "transparent" }}>
-                      {t.done ? "✓" : ""}
-                    </span>
                   </div>
                   {inProgress
                     ? <div style={S.tlRemaining}>{end - nowMin} min remaining</div>
@@ -1101,17 +1176,16 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onDelete, onMove, onS
               {canPush && <PushBar taskDate={t.date} onMove={(d) => onMove(t.id, d)} />}
             </div>
 
-            {(stored || t.recurring) && (
-              <div style={S.tlActions}>
-                {stored && (
-                  <button onClick={() => onStar(t.id, !t.important)} style={{ ...S.actBtn, color: t.important ? "#d4a056" : faint }}
-                    title={t.important ? "Starred — shown in Month ahead. Tap to unstar." : "Star — show in Month ahead"}
-                    className={t.important ? "" : "cd-del"}>{t.important ? "★" : "☆"}</button>
-                )}
-                <button onClick={() => onEdit(t)} style={S.actBtn} title="Edit" className="cd-del">✎</button>
-                <button onClick={() => onDelete(t)} style={S.actBtn} title={t.recurring ? "Delete (repeating)" : "Delete"} className="cd-del">×</button>
-              </div>
-            )}
+            <button
+              onClick={() => onToggle(t.id)}
+              style={S.checkBtn}
+              title={t.done ? "Mark not done" : "Mark complete"}
+              aria-pressed={t.done}
+            >
+              <span style={{ ...S.check, borderColor: c.dot, background: t.done ? c.dot : "transparent" }}>
+                {t.done ? "✓" : ""}
+              </span>
+            </button>
           </div>
         );
       })}
@@ -1308,7 +1382,7 @@ function ScopePopup({ mode, task, onThis, onFollowing, onAll, onClose }) {
   );
 }
 
-function EditModal({ task, onSave, onClose }) {
+function EditModal({ task, onSave, onDelete, onClose }) {
   const [title, setTitle] = useState(task.title || "");
   const [start, setStart] = useState(task.start || "");
   const [end, setEnd] = useState(task.end || "");
@@ -1362,11 +1436,14 @@ function EditModal({ task, onSave, onClose }) {
           </div>
           {!task.recurring && <StarToggle important={important} onToggle={() => setImportant((s) => !s)} />}
           <SharedToggle shared={shared} onToggle={() => setShared((s) => !s)} />
-          <div style={S.addActions}>
-            <button style={S.cancelBtn} onClick={onClose}>Cancel</button>
-            <button style={S.saveBtn} disabled={!title.trim()} onClick={save}>
-              {task.recurring ? "Save…" : "Save"}
-            </button>
+          <div style={S.editActions}>
+            <button style={S.deleteBtn} onClick={onDelete}>{task.recurring ? "Delete…" : "Delete"}</button>
+            <div style={S.addActions}>
+              <button style={S.cancelBtn} onClick={onClose}>Cancel</button>
+              <button style={S.saveBtn} disabled={!title.trim()} onClick={save}>
+                {task.recurring ? "Save…" : "Save"}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1422,7 +1499,7 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar, onShare })
               <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
               <span style={S.imminentTitle}>{m.shared ? <span title="Shared on both decks">🔗 </span> : null}{m.title}</span>
               {isStored(m.id) && (
-                <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
+                <button onClick={() => onRemove(m.id)} style={S.del} title="Delete">×</button>
               )}
             </div>
           ))}
@@ -1452,7 +1529,7 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar, onShare })
                 ? <button onClick={() => onStar(m.id, false)} style={S.starRow} title="Unstar — remove from Month ahead">★</button>
                 : <span />}
               {isStored(m.id)
-                ? <button onClick={() => onRemove(m.id)} style={S.del} className="cd-del">×</button>
+                ? <button onClick={() => onRemove(m.id)} style={S.del} title="Delete">×</button>
                 : <span />}
             </div>
           );
@@ -1535,7 +1612,7 @@ const globalCss = `
 `;
 
 const S = {
-  shell: { minHeight: "100vh", background: `radial-gradient(120% 80% at 0% 0%, #f4f7fc 0%, ${paper} 55%, #e7ecf5 100%)`,
+  shell: { minHeight: "100vh", background: "var(--app-bg)",
            fontFamily: "'Spline Sans', sans-serif", color: ink, padding: "28px clamp(16px,4vw,48px) 48px", animation: "rise .5s ease" },
   loading: { fontFamily: "'Fraunces', serif", fontSize: 22, color: muted, padding: 60, textAlign: "center" },
   errorBanner: { maxWidth: 1200, margin: "0 auto 14px", padding: "8px 14px", borderRadius: 10,
@@ -1545,6 +1622,18 @@ const S = {
   profileBar: { display: "flex", gap: 6, marginBottom: 8 },
   profilePill: { padding: "5px 14px", borderRadius: 999, border: `1px solid ${line}`, background: cardBg, color: muted,
     fontSize: 12.5, fontWeight: 600, letterSpacing: "0.02em", cursor: "pointer", fontFamily: "inherit", transition: "all .18s ease" },
+  loginCard: { width: "100%", maxWidth: 360, background: cardBg, border: `1px solid ${line}`, borderRadius: 22,
+    padding: "28px 26px", display: "flex", flexDirection: "column", gap: 12, boxShadow: "0 30px 60px -30px rgba(30,40,70,0.45)" },
+  loginKicker: { fontSize: 12, fontWeight: 700, letterSpacing: "0.14em", textTransform: "uppercase", color: accent },
+  loginTitle: { fontFamily: "'Fraunces', serif", fontSize: 26, fontWeight: 600, color: ink, margin: 0 },
+  loginSub: { fontSize: 13.5, color: muted, margin: "0 0 4px", lineHeight: 1.5 },
+  loginPills: { display: "flex", gap: 10 },
+  loginPill: { flex: 1, padding: "10px 0", borderRadius: 12, border: `1px solid ${line}`, background: cardBg, color: muted,
+    fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", transition: "all .18s ease" },
+  loginInputErr: { borderColor: "#e0a3a3" },
+  loginErr: { fontSize: 12.5, color: "#b5483f", fontWeight: 600 },
+  loginBtn: { marginTop: 4, padding: "12px", borderRadius: 12, border: "none", background: accent, color: "#fff",
+    fontSize: 15, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   shareToggle: { display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "9px 12px", borderRadius: 12,
     border: `1px dashed ${line}`, background: "transparent", color: muted, fontSize: 13, fontWeight: 600,
     fontFamily: "inherit", cursor: "pointer", transition: "all .18s ease" },
@@ -1571,7 +1660,7 @@ const S = {
   h2: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: 0, color: ink },
   cardSub: { fontSize: 12.5, color: muted },
   timeline: { display: "flex", flexDirection: "column", gap: 0 },
-  tlRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 24px", gap: 8, alignItems: "stretch" },
+  tlRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 38px", gap: 8, alignItems: "stretch" },
   tlTime: { fontSize: 12, color: muted, paddingTop: 14, fontVariantNumeric: "tabular-nums", textAlign: "right" },
   tlNowTime: { color: accent, fontWeight: 700 },
   tlTimeEnd: { fontSize: 11, color: faint, marginTop: 2 },
@@ -1597,13 +1686,15 @@ const S = {
   pushBtn: { fontSize: 11.5, fontWeight: 600, color: accent, background: accentSoft, border: `1px solid ${accentBorder}`,
              borderRadius: 8, padding: "3px 9px", cursor: "pointer", fontFamily: "inherit" },
   pushDate: { fontSize: 11.5, padding: "2px 6px", borderRadius: 8, border: `1px solid ${accentBorder}`, fontFamily: "inherit", color: ink, background: "#fff" },
-  tlGapRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 24px", gap: 8, alignItems: "stretch", minHeight: 30 },
+  tlGapRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 38px", gap: 8, alignItems: "stretch", minHeight: 30 },
   tlGap: { display: "flex", alignItems: "center", gap: 8, padding: "4px 2px", fontSize: 12.5, color: faint, fontStyle: "italic" },
   tlGapIcon: { fontSize: 13, opacity: 0.75, fontStyle: "normal" },
   tlGapNow: { color: accent, fontWeight: 600, fontStyle: "normal" },
   tlEmpty: { fontSize: 13.5, color: muted, fontStyle: "italic", padding: "16px 2px", lineHeight: 1.5 },
   tlActions: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2 },
   actBtn: { background: "none", border: "none", color: faint, fontSize: 15, lineHeight: 1, cursor: "pointer", padding: 0 },
+  checkBtn: { background: "none", border: "none", padding: 0, margin: 0, cursor: "pointer", alignSelf: "stretch",
+              display: "flex", alignItems: "center", justifyContent: "center" },
   tag: { fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", marginTop: 7, display: "inline-block" },
   check: { width: 22, height: 22, borderRadius: "50%", border: "2px solid", display: "flex", alignItems: "center", justifyContent: "center",
            color: "#fff", fontSize: 13, flex: "0 0 auto", fontWeight: 700 },
@@ -1617,6 +1708,8 @@ const S = {
   catPick: { display: "flex", gap: 7, flexWrap: "wrap" },
   catChip: { padding: "6px 12px", borderRadius: 20, border: "1.5px solid", fontSize: 12.5, fontWeight: 600, cursor: "pointer", background: "transparent", fontFamily: "inherit" },
   addActions: { display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 2 },
+  editActions: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 2 },
+  deleteBtn: { padding: "8px 14px", borderRadius: 10, border: "1px solid #e6c3c3", background: "#fff", color: "#b5483f", fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   cancelBtn: { padding: "8px 16px", borderRadius: 10, border: `1px solid ${line}`, background: "#fff", color: muted, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   saveBtn: { padding: "8px 18px", borderRadius: 10, border: "none", background: accent, color: "#fff", fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   workoutCard: { background: "var(--accent-grad)", border: "none", color: "#fff" },
