@@ -69,7 +69,9 @@ type DayBucket = {
 export async function getWeather(): Promise<WeatherPayload> {
   if (cached && Date.now() < cached.expires) return cached.payload;
 
-  const url = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${config.lat}&lon=${config.lon}`;
+  // "complete", not "compact": only complete carries probability_of_precipitation
+  // (compact left every day's rain chance at 0%).
+  const url = `https://api.met.no/weatherapi/locationforecast/2.0/complete?lat=${config.lat}&lon=${config.lon}`;
   const res = await fetch(url, {
     headers: { "User-Agent": config.yrUserAgent, Accept: "application/json" },
   });
@@ -96,6 +98,9 @@ export async function getWeather(): Promise<WeatherPayload> {
     const precip = typeof next1?.details?.precipitation_amount === "number"
       ? next1.details.precipitation_amount : 0;
 
+    if (typeof next1?.details?.probability_of_precipitation === "number") {
+      bucket.pops.push(next1.details.probability_of_precipitation);
+    }
     // Roll daily aggregates from the 6-hour buckets.
     if (next6) {
       if (typeof next6.details?.probability_of_precipitation === "number") {

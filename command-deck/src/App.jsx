@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
 
 /* ============================================================
    BERGE — Weekly Command Deck (v2)
@@ -15,22 +16,49 @@ const CATS = {
   event:    { label: "Event",    dot: "#d4a056", soft: "rgba(212,160,86,0.14)" },
 };
 
-// Household profiles. Berge is primary (his calendars + intervals.icu);
-// Amanda is the second deck. Shared events surface in both.
-const PROFILE_IDS = ["berge", "amanda"];
-// Each profile carries a full accent palette; the active one is published as
-// CSS variables on the shell so the whole page re-themes on switch.
-const PROFILES = {
-  berge:  { name: "Berge",  color: "#2f5d9e", soft: "#eef3fa", border: "#cdddef", grad: "linear-gradient(135deg, #2f5d9e 0%, #244b80 100%)", glow: "rgba(36,75,128,0.7)",
-            bg: "radial-gradient(120% 80% at 0% 0%, #f4f7fc 0%, #eef1f6 55%, #e7ecf5 100%)" },
-  amanda: { name: "Amanda", color: "#b5547e", soft: "#fbeef4", border: "#edccda", grad: "linear-gradient(135deg, #b5547e 0%, #8f3f63 100%)", glow: "rgba(143,63,99,0.7)",
-            bg: "radial-gradient(120% 80% at 0% 0%, #fdf4f8 0%, #f9eaf1 55%, #f1dde7 100%)" },
+// Household profiles (one deck each) live on the server (/api/profiles) and can
+// be added/removed from the UI. Shared events surface on every deck. This list
+// is only the first-paint fallback before the server answers.
+const DEFAULT_PROFILES = [
+  { id: "berge", name: "Berge", theme: "denim" },
+  { id: "amanda", name: "Amanda", theme: "rose" },
+];
+
+// Each profile picks a palette; the active one is published as CSS variables
+// on the shell so the whole page re-themes on switch. Denim and rose are the
+// original hand-tuned Berge/Amanda palettes; the rest derive from one base color.
+const hexRgb = (hex) => hex.match(/\w\w/g).map((h) => parseInt(h, 16));
+const mixHex = (hex, to, t) => {
+  const b = hexRgb(to);
+  return "#" + hexRgb(hex).map((v, i) => Math.round(v + (b[i] - v) * t).toString(16).padStart(2, "0")).join("");
 };
-const profileOf = (p) => PROFILES[p] || PROFILES.berge;
-const themeVars = (p) => {
-  const t = profileOf(p);
-  return { "--accent": t.color, "--accent-soft": t.soft, "--accent-border": t.border, "--accent-grad": t.grad, "--accent-glow": t.glow, "--app-bg": t.bg };
+const derivePalette = (color) => {
+  const dark = mixHex(color, "#000000", 0.22);
+  return {
+    color, dark, soft: mixHex(color, "#ffffff", 0.91), border: mixHex(color, "#ffffff", 0.76),
+    glow: `rgba(${hexRgb(dark).join(",")},0.7)`,
+    bg: `radial-gradient(120% 80% at 0% 0%, ${mixHex(color, "#ffffff", 0.95)} 0%, ${mixHex(color, "#ffffff", 0.9)} 55%, ${mixHex(color, "#ffffff", 0.82)} 100%)`,
+  };
 };
+const PALETTES = {
+  denim: { color: "#2f5d9e", soft: "#eef3fa", border: "#cdddef", dark: "#244b80", glow: "rgba(36,75,128,0.7)",
+           bg: "radial-gradient(120% 80% at 0% 0%, #f4f7fc 0%, #eef1f6 55%, #e7ecf5 100%)" },
+  rose:  { color: "#b5547e", soft: "#fbeef4", border: "#edccda", dark: "#8f3f63", glow: "rgba(143,63,99,0.7)",
+           bg: "radial-gradient(120% 80% at 0% 0%, #fdf4f8 0%, #f9eaf1 55%, #f1dde7 100%)" },
+  sage:  derivePalette("#5a8a55"),
+  plum:  derivePalette("#7d5a9e"),
+  amber: derivePalette("#b07a2a"),
+  teal:  derivePalette("#2f8a88"),
+  slate: derivePalette("#56637a"),
+  coral: derivePalette("#c8604a"),
+};
+const paletteOf = (theme) => PALETTES[theme] || PALETTES.denim;
+const themeVars = (theme) => {
+  const t = paletteOf(theme);
+  return { "--accent": t.color, "--accent-soft": t.soft, "--accent-border": t.border, "--accent-dark": t.dark, "--accent-glow": t.glow, "--app-bg": t.bg };
+};
+// Look up a profile in the list, falling back to the first one.
+const profileIn = (profiles, id) => profiles.find((p) => p.id === id) || profiles[0];
 
 const stripBursdag = (s) => s.replace(/\s*sin\s+bursdag\s*$/i, "").trim();
 
@@ -126,10 +154,227 @@ function computeFuel(durationMin, tss, cfg = FUEL) {
 
 const fmtCount = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
 
+// ── Coach prompt generator ────────────────────────────────────────
+// Zero-API training planner. The app assembles a rich prompt from live
+// intervals.icu data + the calendar window + this static brief; you paste it
+// into a Claude chat (no API spend) and Claude returns a plan. The "## How to
+// respond" block asks for a JSON array we'll later import straight back into
+// the app. Edit COACH freely — it's the "who I am / how to plan for me" half;
+// the live numbers are filled in at generate time. TODO: move COACH to settings.
+const COACH = {
+  athlete: [
+    "Cycling-focused endurance athlete based in Bergen, Norway (hilly, wet — indoor trainer is fine).",
+    "3 years of structured endurance training with a solid racing history across short and long events.",
+    "Completed Bergen–Voss 2025 in 4:34 — that is the A-race target again next year; train to beat that time.",
+    "Many years of strength training background — compound lifts are familiar, not new stimulus.",
+    "Current capacity: can absorb high-volume weeks (10–15+ hours) and multi-hour rides without issue.",
+    "Do NOT cap sessions at 45–60 min — rides of 2–4 h are normal and appropriate for this athlete.",
+    "Primary goal: build aerobic base with high Zone-2 volume, plus some targeted high intensity (threshold / VO2).",
+    "Secondary: compound strength 2×/week (squat, deadlift, press) and short mobility most days.",
+  ].join(" "),
+  rules: [
+    "Polarized ~80/20 — most time easy in Z1–Z2, intensity in deliberate, well-spaced doses.",
+    "Respect form (TSB): clearly negative → keep it easy / add recovery; fresh & positive → a harder block is fine.",
+    "Ramp weekly TSS by at most ~5–8% over the recent 7-day load — don't spike it.",
+    "Never two hard days back-to-back; follow a hard day with easy or rest.",
+    "Schedule AROUND the existing calendar blocks below — never double-book work or social commitments.",
+    "Strength 2×/week on easier-ride days; mobility 10–15 min on most days.",
+    "For every ride give a concrete target: duration + zone (and target power or HR) + a TSS estimate.",
+  ],
+};
+
+// Assemble the copy-paste training prompt. `tasks` is the in-memory allTasks
+// list (the app already holds a 120-day window); we slice it to [start,end]
+// for the "already on my calendar" section so Claude plans around commitments.
+function buildCoachPrompt({ data, tasks, weather, start, end, notes }) {
+  const load = data?.load || {}, ftp = data?.ftp || {}, hr = data?.hr || {}, wel = data?.wellness || {};
+  const wkg = ftp.value && wel.weight ? (ftp.value / wel.weight).toFixed(1) : null;
+  const days = Math.max(1, Math.round((new Date(end) - new Date(start)) / 86400000) + 1);
+  const L = [];
+
+  L.push(`You are my cycling & strength coach. Build me a training plan from ${start} to ${end} (${days} days).`, "");
+
+  L.push(`## Current state — intervals.icu, as of ${(data?.asOf || "").slice(0, 10)}`);
+  L.push(`Fitness CTL ${load.ctl ?? "—"} · Fatigue ATL ${load.atl ?? "—"} · Form TSB ${load.form ?? "—"}`);
+  L.push(`7-day load ${load.last7Tss ?? 0} TSS · 6-week load ${load.last42Tss ?? 0} TSS`);
+  L.push(`FTP ${ftp.value ?? "—"} W${wkg ? ` (${wkg} W/kg)` : ""} · Threshold HR ${hr.lthr ?? "—"} bpm${hr.maxHr ? ` · max ${hr.maxHr}` : ""}`);
+  L.push(`Sleep ${fmtSleep(wel.sleepSecs)} · HRV ${wel.hrv ?? "—"} ms · Resting HR ${wel.restingHR ?? "—"} bpm · Weight ${wel.weight ?? "—"} kg`);
+  if (data?.staleDays != null && data.staleDays > 2) L.push(`(heads up: last activity was ${data.staleDays} days ago — numbers may lag)`);
+  L.push("");
+
+  if (data?.recent?.length) {
+    L.push("Recent sessions:");
+    data.recent.forEach((a) =>
+      L.push(`- ${a.date} · ${a.type} · ${a.load ?? "?"} TSS${a.durationSec ? ` · ${fmtDur(a.durationSec)}` : ""}${a.avgHr ? ` · avg HR ${a.avgHr}` : ""}`));
+    L.push("");
+  }
+
+  L.push("## Me & my preferences");
+  L.push(COACH.athlete);
+  if (ftp.zones?.length) L.push(`Power zones (W): ${ftp.zones.map((z) => `${z.name} ${z.from}${z.to ? `–${z.to}` : "+"}`).join(" · ")}`);
+  if (hr.zones?.length) L.push(`HR zones (bpm): ${hr.zones.map((z) => `${z.name} ${z.from || "<"}${z.to ? `–${z.to}` : "+"}`).join(" · ")}`);
+  L.push("");
+
+  const inRange = (tasks || [])
+    .filter((t) => t.date >= start && t.date <= end)
+    .sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
+  L.push(`## Already on my calendar, ${start} → ${end}`);
+  if (!inRange.length) {
+    L.push("(nothing scheduled — the days are open)");
+  } else {
+    let lastDate = "";
+    inRange.forEach((t) => {
+      if (t.date !== lastDate) {
+        const d = new Date(t.date + "T00:00:00");
+        L.push(`${DAYS[(d.getDay() + 6) % 7]} ${t.date}:`);
+        lastDate = t.date;
+      }
+      const time = t.start ? `${t.start}${t.end ? `–${t.end}` : ""}` : "all-day";
+      const cat = CATS[t.cat]?.label || t.cat || "";
+      L.push(`  • ${time} ${t.title}${cat ? ` [${cat}]` : ""}`);
+    });
+  }
+  L.push("");
+
+  const wxDays = (weather?.days || []).filter((w) => w.date >= start && w.date <= end);
+  if (wxDays.length) {
+    L.push(`## Weather forecast — Bergen (YR.no, next ${wxDays.length} days)`);
+    wxDays.forEach((w) => {
+      const totalPrecip = w.hours.reduce((s, h) => s + (h.precip || 0), 0);
+      const maxWind = w.hours.length ? Math.max(...w.hours.map((h) => h.wind)) : 0;
+      const heavyRain = w.pop >= 70 || totalPrecip >= 5;
+      let line = `${w.date} (${w.d}): ${w.icon} ${w.hi}/${w.lo}°C · rain ${w.pop}%`;
+      if (totalPrecip > 0) line += ` · ${totalPrecip.toFixed(1)} mm`;
+      if (maxWind >= 8) line += ` · wind ${maxWind} m/s`;
+      if (heavyRain) line += " ← heavy rain: prefer run or indoor trainer over outdoor ride";
+      L.push(line);
+    });
+    if (wxDays.length < Math.max(1, Math.round((new Date(end) - new Date(start)) / 86400000) + 1)) {
+      L.push("(YR.no forecast only covers 7 days — plan remaining days based on typical Bergen conditions)");
+    }
+    L.push("");
+  }
+
+  L.push("## How to plan");
+  COACH.rules.forEach((r) => L.push(`- ${r}`));
+  L.push("");
+
+  if (notes && notes.trim()) {
+    L.push("## Extra notes for this block", notes.trim(), "");
+  }
+
+  L.push("## How to respond");
+  L.push("1. A short day-by-day plan I can scan (date · session · target · why).");
+  L.push("2. Then the SAME plan as a JSON array in a ```json code block, exactly this shape — I'll import it straight into my app:");
+  L.push("```json");
+  L.push('[{"date":"YYYY-MM-DD","start":"HH:MM","end":"HH:MM","title":"Z2 endurance","sport":"Ride","tss":75,"note":"session detail incl. targets"}]');
+  L.push("```");
+  L.push(`Rules: dates within ${start}–${end}; 24-hour times (end optional); sport one of Ride / Run / Strength / Mobility / Swim / Other; tss an integer estimate (0 for mobility); note = the actual session prescription. Only include sessions you want added — leave rest days out.`);
+
+  return L.join("\n");
+}
+
+// ── Plan import (Stage 2) ─────────────────────────────────────────
+const PLAN_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const PLAN_TIME_RE = /^([01]?\d|2[0-3]):[0-5]\d$/;
+const padTime = (s) => {
+  const m = String(s ?? "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  return m ? `${m[1].padStart(2, "0")}:${m[2]}` : String(s ?? "").trim();
+};
+
+// Pull a JSON array out of whatever got pasted: raw JSON, a ```json fenced
+// block, or a whole Claude reply with prose wrapped around the array.
+function extractJsonArray(text) {
+  const t = (text || "").trim();
+  if (!t) return null;
+  const tryParse = (s) => { try { return JSON.parse(s); } catch { return undefined; } };
+  let v = tryParse(t);
+  if (Array.isArray(v)) return v;
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) { v = tryParse(fence[1].trim()); if (Array.isArray(v)) return v; }
+  const i = t.indexOf("["), j = t.lastIndexOf("]");
+  if (i >= 0 && j > i) { v = tryParse(t.slice(i, j + 1)); if (Array.isArray(v)) return v; }
+  return null;
+}
+
+// Parse + validate pasted plan text into normalized blocks. Returns either
+// { error } or { blocks, skipped } (skipped = 1-based indices that failed).
+function parsePlan(text) {
+  const arr = extractJsonArray(text);
+  if (!arr) return { error: "Couldn't find a JSON array. Paste the [ … ] block Claude gave you (the whole reply is fine)." };
+  const blocks = [], skipped = [];
+  arr.forEach((b, i) => {
+    const date = String(b?.date ?? "").trim();
+    const title = String(b?.title ?? "").trim();
+    if (!PLAN_DATE_RE.test(date) || Number.isNaN(Date.parse(date)) || !title) { skipped.push(i + 1); return; }
+    const start = b?.start ? padTime(b.start) : "";
+    const end = b?.end ? padTime(b.end) : "";
+    if ((start && !PLAN_TIME_RE.test(start)) || (end && !PLAN_TIME_RE.test(end))) { skipped.push(i + 1); return; }
+    const tssNum = Number(b?.tss);
+    blocks.push({
+      date, start, end, title,
+      sport: String(b?.sport ?? "").trim(),
+      tss: Number.isFinite(tssNum) && tssNum > 0 ? Math.round(tssNum) : null,
+      note: String(b?.note ?? "").trim(),
+    });
+  });
+  if (!blocks.length) return { error: "No valid sessions found — each needs at least a date and a title." };
+  return { blocks, skipped };
+}
+
+// Day-grouped preview of a parsed plan, shown before the user confirms import.
+function ImportPreview({ blocks, skipped }) {
+  const groups = [];
+  let last = null;
+  [...blocks].sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || ""))).forEach((b) => {
+    if (!last || last.date !== b.date) { last = { date: b.date, items: [] }; groups.push(last); }
+    last.items.push(b);
+  });
+  return (
+    <div style={S.importPreview}>
+      <div style={S.importPreviewHead}>
+        {blocks.length} session{blocks.length === 1 ? "" : "s"}{skipped?.length ? ` · ${skipped.length} skipped` : ""}
+      </div>
+      {groups.map((g) => {
+        const d = new Date(g.date + "T00:00:00");
+        return (
+          <div key={g.date} style={S.previewGroup}>
+            <div style={S.previewDay}>{DAYS[(d.getDay() + 6) % 7]} {g.date}</div>
+            {g.items.map((b, i) => (
+              <div key={i} style={S.previewRow}>
+                <span style={S.previewTime}>{b.start ? (b.end ? `${b.start}–${b.end}` : b.start) : "—"}</span>
+                <span style={S.previewTitle}>{b.title}</span>
+                <span style={S.previewMeta}>{[b.sport, b.tss ? `${b.tss} TSS` : null].filter(Boolean).join(" · ")}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 const REFRESH_MS = 5 * 60 * 1000;
 
+// Unlock token for the PIN-protected profile open in this tab (null = none).
+// Lives only in memory, so a reload locks the profile again.
+let unlockToken = null;
+const setUnlockToken = (t) => { unlockToken = t; };
+const apiFetch = (url, opts = {}) =>
+  fetch(url, unlockToken ? { ...opts, headers: { ...opts.headers, "X-Profile-Unlock": unlockToken } } : opts);
+
 const jsonPost = (url, body) =>
-  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  apiFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const jsonSend = (method, url, body) =>
+  apiFetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+// Last-known profile list, so the pills paint instantly on reload.
+const readCachedProfiles = () => {
+  try {
+    const v = JSON.parse(localStorage.getItem("cd.profiles"));
+    return Array.isArray(v) && v.length ? v : DEFAULT_PROFILES;
+  } catch { return DEFAULT_PROFILES; }
+};
 
 export default function App() {
   const today = useMemo(() => { const d = new Date(); d.setHours(0,0,0,0); return d; }, []);
@@ -138,7 +383,10 @@ export default function App() {
   const [birthdays, setBirthdays] = useState([]);
   const [weather, setWeather] = useState(null);
   const [localTasks, setLocalTasks] = useState([]);
+  const [todos, setTodos] = useState([]);
   const [doneIds, setDoneIds] = useState([]);
+  const [places, setPlaces] = useState([]); // saved locations (work, gym, …)
+  const [home, setHome] = useState(null);   // dedicated home anchor { address, lat, lon } | null
   const [selectedDate, setSelectedDate] = useState(iso(today));
   const [openWeatherDate, setOpenWeatherDate] = useState(null);
   const [status, setStatus] = useState("loading");
@@ -149,15 +397,112 @@ export default function App() {
   const [editTask, setEditTask] = useState(null); // task open in the edit form
   const [scopePrompt, setScopePrompt] = useState(null); // { mode:'edit'|'delete', task, edited? }
   const [now, setNow] = useState(() => new Date());
-  const [profile, setProfile] = useState(() => {
-    const p = localStorage.getItem("cd.profile");
-    return PROFILE_IDS.includes(p) ? p : "berge";
-  });
+  const [profiles, setProfiles] = useState(readCachedProfiles);
+  const [profilesOpen, setProfilesOpen] = useState(false);
+  // The stored pick may name a profile removed on another device; resolving it
+  // through profileIn falls back to the first profile (the server does the same).
+  const [profilePick, setProfile] = useState(() => localStorage.getItem("cd.profile") || "berge");
+  const activeProfile = useMemo(() => profileIn(profiles, profilePick), [profiles, profilePick]);
+  const profile = activeProfile.id;
+  const theme = activeProfile.theme;
 
-  const switchProfile = (p) => {
-    if (p === profile) return;
-    localStorage.setItem("cd.profile", p);
+  // PINs: the device's owner profile (from its sign-in) opens freely; any
+  // other profile with a PIN asks for it on every switch and re-locks when you
+  // switch away. `pinPrompt` is the profile id currently asking for its PIN.
+  const [owner, setOwner] = useState("");
+  const [pinPrompt, setPinPrompt] = useState(null);
+  const [settingsFor, setSettingsFor] = useState(null); // profile id whose settings sheet is open
+  const pendingSettings = useRef(null); // open this profile's settings once its PIN is entered
+  const [unlocked, setUnlocked] = useState(null); // profile id unlockToken belongs to
+  const needsPin = (id) => { const p = profiles.find((x) => x.id === id); return !!p?.hasPin && id !== owner; };
+
+  const switchProfile = (p, { token } = {}) => {
+    if (p === profile && !token) return;
+    if (token) { setUnlockToken(token); setUnlocked(p); }
+    else if (needsPin(p)) { setPinPrompt(p); return; }
+    else { setUnlockToken(null); setUnlocked(null); }
+    // Only profiles this device can open without a PIN become its default.
+    if (!needsPin(p)) localStorage.setItem("cd.profile", p);
     setProfile(p);
+  };
+
+  const unlockProfile = async (id, pin, claim) => {
+    const res = await jsonPost(`/api/profiles/${encodeURIComponent(id)}/unlock`, { pin, claim });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+    if (claim) { setOwner(id); localStorage.setItem("cd.profile", id); }
+    setPinPrompt(null);
+    switchProfile(id, { token: body.unlock });
+    if (pendingSettings.current === id) { pendingSettings.current = null; setProfilesOpen(false); setSettingsFor(id); }
+  };
+
+  // Long-press a pill (or tap a row in the Profiles sheet): a locked profile
+  // asks for its PIN first, then its settings open.
+  const openSettings = (id) => {
+    if (needsPin(id) && unlocked !== id) { pendingSettings.current = id; setPinPrompt(id); return; }
+    setProfilesOpen(false);
+    setSettingsFor(id);
+  };
+
+  const profileError = (body, res) => (body.error === "locked" ? "Enter this profile's PIN first" : body.error || `HTTP ${res.status}`);
+
+  const updateProfile = async (id, patch) => {
+    const res = await jsonSend("PATCH", `/api/profiles/${encodeURIComponent(id)}`, patch);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(profileError(body, res));
+    applyProfiles(profiles.map((p) => (p.id === id ? { ...p, name: body.name, theme: body.theme } : p)));
+  };
+
+  // Sign out every other device that belongs to this profile (and any open PIN
+  // unlocks of it). This device stays in.
+  const signOutOthers = async (id) => {
+    const res = await jsonPost(`/api/profiles/${encodeURIComponent(id)}/signout`, {});
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(profileError(body, res));
+    if (body.unlock && id === unlocked) setUnlockToken(body.unlock);
+  };
+
+  // Where to go when a PIN prompt is dismissed: this device's own profile, or
+  // any profile without a PIN. null = nowhere, so the prompt can't be dismissed.
+  const pinFallback = (lockedId) =>
+    [owner, ...profiles.filter((p) => !p.hasPin).map((p) => p.id)].find((id) => id && id !== lockedId && profiles.some((p) => p.id === id)) || null;
+
+  const setPin = async (id, pin) => {
+    const res = await jsonSend("PUT", `/api/profiles/${encodeURIComponent(id)}/pin`, { pin });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(profileError(body, res));
+    applyProfiles(profiles.map((p) => (p.id === id ? { ...p, hasPin: body.hasPin } : p)));
+    // Keep this tab in: a fresh PIN would otherwise lock us out of the profile.
+    if (body.unlock && (id === profile || id === unlocked)) { setUnlockToken(body.unlock); setUnlocked(id); }
+  };
+
+  const applyProfiles = useCallback((list) => {
+    setProfiles(list);
+    try { localStorage.setItem("cd.profiles", JSON.stringify(list)); } catch { /* storage full/blocked */ }
+  }, []);
+
+  // The profile list is readable before sign-in (the login screen needs it).
+  const loadProfiles = useCallback(async () => {
+    try { const res = await apiFetch("/api/profiles"); if (res.ok) applyProfiles(await res.json()); }
+    catch (e) { console.warn("profiles load failed", e); }
+  }, [applyProfiles]);
+  useEffect(() => { loadProfiles(); }, [loadProfiles]);
+
+  const addProfile = async (draft) => {
+    const res = await jsonPost("/api/profiles", draft);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+    applyProfiles([...profiles, body]);
+    return body;
+  };
+
+  const removeProfile = async (id) => {
+    const res = await apiFetch(`/api/profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(profileError(body, res));
+    const rest = profiles.filter((p) => p.id !== id);
+    applyProfiles(rest);
+    if (id === profile) switchProfile(rest[0].id);
   };
 
   // Undo ("regret") toast for accidental deletes.
@@ -180,13 +525,22 @@ export default function App() {
   const fetchData = useCallback(async (overrideProfile) => {
     try {
       const start = iso(today);
-      const res = await fetch(`/api/data?start=${start}&days=120&profile=${overrideProfile || profile}`);
+      const res = await apiFetch(`/api/data?start=${start}&days=120&profile=${overrideProfile || profile}`);
       if (res.status === 401) { setStatus("auth"); return; }
+      if (res.status === 403) {
+        // Profile is PIN-locked (e.g. a PIN was set elsewhere, or the unlock
+        // expired): drop whatever was on screen and ask for the PIN.
+        setCalendarTasks([]); setLocalTasks([]); setTodos([]);
+        setPinPrompt(overrideProfile || profile);
+        setStatus("ready");
+        return;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCalendarTasks(data.tasks || []);
       setBirthdays(data.birthdays || []);
       setLocalTasks(data.localTasks || []);
+      setTodos(data.todos || []);
       setDoneIds(data.doneIds || []);
       setWeather(data.weather || null);
       setStatus("ready");
@@ -198,25 +552,116 @@ export default function App() {
   }, [today, profile]);
 
   // Trusted-device login: enter the shared passcode once + pick who this device
-  // belongs to. On success the server sets a long-lived cookie and the chosen
-  // profile becomes this device's default. Returns false on a bad passcode.
-  const login = useCallback(async (passcode, chosenProfile) => {
-    const res = await fetch("/api/login", {
+  // belongs to (its PIN too, if it has one). On success the server sets a
+  // long-lived cookie and the chosen profile becomes this device's owner and
+  // default. Returns an error message, or null on success.
+  const login = useCallback(async (passcode, chosenProfile, pin) => {
+    const res = await apiFetch("/api/login", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      credentials: "include", body: JSON.stringify({ passcode }),
+      credentials: "include", body: JSON.stringify({ passcode, profile: chosenProfile, pin }),
     });
-    if (!res.ok) return false;
-    if (PROFILE_IDS.includes(chosenProfile)) { localStorage.setItem("cd.profile", chosenProfile); setProfile(chosenProfile); }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      return body.pin ? body.error : "Wrong passcode — try again.";
+    }
+    setOwner(chosenProfile);
+    localStorage.setItem("cd.profile", chosenProfile); setProfile(chosenProfile);
     setStatus("loading");
     fetchData(chosenProfile);
-    return true;
+    return null;
   }, [fetchData]);
+
+  // Which profile this device belongs to (opens without a PIN here).
+  useEffect(() => {
+    if (status !== "ready") return;
+    apiFetch("/api/session").then((r) => (r.ok ? r.json() : null)).then((s) => s && setOwner(s.owner))
+      .catch((e) => console.warn("session load failed", e));
+  }, [status]);
+
+  // --- To-dos: optimistic, like the done-state toggles ---
+  const addTodo = async (title) => {
+    const res = await jsonPost("/api/todos", { title, profile });
+    if (res.ok) { const t = await res.json(); setTodos((prev) => [...prev, t]); }
+  };
+  const toggleTodo = (t) => {
+    setTodos((prev) => prev.map((x) => (x.id === t.id ? { ...x, done: t.done ? 0 : 1 } : x)));
+    jsonSend("PATCH", `/api/todos/${encodeURIComponent(t.id)}`, { done: !t.done }).catch((e) => console.warn("todo toggle failed", e));
+  };
+  const removeTodo = (t) => {
+    setTodos((prev) => prev.filter((x) => x.id !== t.id));
+    apiFetch(`/api/todos/${encodeURIComponent(t.id)}`, { method: "DELETE" }).catch((e) => console.warn("todo delete failed", e));
+    showToast(`Removed “${t.title}”`, () => addTodo(t.title));
+  };
+  const clearDoneTodos = () => {
+    setTodos((prev) => prev.filter((x) => !x.done));
+    jsonPost("/api/todos/clear", { profile }).catch((e) => console.warn("todo clear failed", e));
+  };
 
   useEffect(() => {
     fetchData();
     const id = setInterval(fetchData, REFRESH_MS);
     return () => clearInterval(id);
   }, [fetchData]);
+
+  // After a deploy, an app left open (especially from the home screen, which
+  // has no reload button) keeps running the old code. The server reports its
+  // build in /api/health. Coming back to the app with a new build waiting →
+  // reload quietly, unless a sheet/form is open (don't lose typing); otherwise
+  // offer an "update" bar. Coming back also refetches the day's data.
+  const [updateReady, setUpdateReady] = useState(false);
+  const loadedVersion = useRef(null);
+  useEffect(() => {
+    const check = async (foreground) => {
+      try {
+        const res = await fetch("/api/health", { cache: "no-store" });
+        const { version } = await res.json();
+        if (!version) return;
+        if (loadedVersion.current === null) { loadedVersion.current = version; return; }
+        if (version === loadedVersion.current) return;
+        const busy = document.querySelector(".cd-ov-backdrop") || document.activeElement?.matches?.("input, textarea, select");
+        if (foreground && !busy) window.location.reload();
+        else setUpdateReady(true);
+      } catch { /* offline: try again next time */ }
+    };
+    check(false);
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      check(true);
+      fetchData();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    const id = setInterval(() => check(false), REFRESH_MS);
+    return () => { document.removeEventListener("visibilitychange", onVisible); clearInterval(id); };
+  }, [fetchData]);
+
+  // Saved locations + the home anchor back the commute travel blocks. Load once
+  // we're past the auth gate; both geocode server-side and update state live.
+  const loadPlaces = useCallback(async () => {
+    try { const res = await apiFetch("/api/places"); if (res.ok) setPlaces(await res.json()); }
+    catch (e) { console.warn("places load failed", e); }
+  }, []);
+  const loadHome = useCallback(async () => {
+    try { const res = await apiFetch("/api/home"); if (res.ok) setHome(await res.json()); }
+    catch (e) { console.warn("home load failed", e); }
+  }, []);
+  useEffect(() => { if (status === "ready") { loadPlaces(); loadHome(); } }, [status, loadPlaces, loadHome]);
+
+  const addPlace = useCallback(async (label, address) => {
+    const res = await jsonPost("/api/places", { label, address });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
+    const created = await res.json();
+    setPlaces((prev) => [...prev, created]);
+    return created;
+  }, []);
+  const saveHome = useCallback(async (address) => {
+    const res = await apiFetch("/api/home", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address }),
+    });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
+    const h = await res.json();
+    setHome(h);
+    return h;
+  }, []);
 
   // One-time migration: push any localStorage values to the server, then clear them.
   useEffect(() => {
@@ -228,7 +673,7 @@ export default function App() {
         const di = JSON.parse(localStorage.getItem("cd.doneIds") || "[]");
         const m  = JSON.parse(localStorage.getItem("cd.month") || "[]");
         for (const t of lt) await jsonPost("/api/tasks", t);
-        for (const id of di) await fetch(`/api/done/${encodeURIComponent(id)}`, { method: "POST" });
+        for (const id of di) await apiFetch(`/api/done/${encodeURIComponent(id)}`, { method: "POST" });
         // Month-ahead events are now stored tasks; mark them important on the way in.
         for (const e of m) await jsonPost("/api/tasks", { ...e, important: e.important === false || e.important === 0 ? 0 : 1 });
         localStorage.setItem("cd.migrated", "1");
@@ -255,7 +700,7 @@ export default function App() {
     const wasDone = doneSet.has(id);
     setDoneIds((prev) => wasDone ? prev.filter(x => x !== id) : [...prev, id]);
     const url = `/api/done/${encodeURIComponent(id)}`;
-    fetch(url, { method: wasDone ? "DELETE" : "POST" }).catch((e) => console.warn("toggle failed", e));
+    apiFetch(url, { method: wasDone ? "DELETE" : "POST" }).catch((e) => console.warn("toggle failed", e));
   };
 
   // One add path for both the daily timeline and the month-ahead adder. The
@@ -272,11 +717,22 @@ export default function App() {
     }
   };
 
+  // Import a Claude-generated plan (Stage-2 of the prompt flow). Blocks land as
+  // source:"claude" training tasks; replaceRange (the plan's own date span) wipes
+  // prior generated training there first so re-imports swap rather than stack.
+  const importTasks = useCallback(async (blocks, replaceRange) => {
+    const res = await jsonPost("/api/tasks/import", { blocks, profile, replaceRange });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
+    const out = await res.json();
+    await fetchData();
+    return out; // { created, replaced }
+  }, [profile, fetchData]);
+
   const removeTask = (id) => {
     if (!isStored(id)) return;
     const t = localTasks.find((x) => x.id === id);
     setLocalTasks((prev) => prev.filter(t => t.id !== id));
-    fetch(`/api/tasks/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("delete failed", e));
+    apiFetch(`/api/tasks/${encodeURIComponent(id)}`, { method: "DELETE" }).catch((e) => console.warn("delete failed", e));
     if (t) showToast(`Deleted “${t.title}”`, async () => {
       dismissToast();
       const res = await jsonPost("/api/tasks", t);
@@ -288,7 +744,7 @@ export default function App() {
   const moveTask = (id, date) => {
     if (!isStored(id)) return;
     setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, date } : t));
-    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    apiFetch(`/api/tasks/${encodeURIComponent(id)}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date }),
     }).catch((e) => console.warn("move failed", e));
   };
@@ -301,13 +757,13 @@ export default function App() {
 
   // --- Edit / delete, with recurrence scope (this / this+following / all) ---
   const recApi = (path, method, body) =>
-    fetch(`/api/recurrences/${path}`, { method, headers: { "Content-Type": "application/json" }, body: body && JSON.stringify(body) })
+    apiFetch(`/api/recurrences/${path}`, { method, headers: { "Content-Type": "application/json" }, body: body && JSON.stringify(body) })
       .then((r) => { if (r.ok) fetchData(); else console.warn("recurrence op failed", r.status); })
       .catch((e) => console.warn("recurrence op failed", e));
 
   const editLocalTask = async (id, fields) => {
     setLocalTasks((prev) => prev.map((t) => t.id === id ? { ...t, ...fields } : t));
-    const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/tasks/${encodeURIComponent(id)}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fields),
     });
     if (!res.ok) { const e = await res.json().catch(() => ({})); alert(`Couldn't save edit: ${e.error || `HTTP ${res.status}`}`); fetchData(); }
@@ -338,7 +794,7 @@ export default function App() {
     } else {
       if (which === "this") {
         // skip the occurrence, then drop a one-off with the edits on that day
-        fetch(`/api/recurrences/${sid}/skip`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date: task.date }) })
+        apiFetch(`/api/recurrences/${sid}/skip`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date: task.date }) })
           .then(() => jsonPost("/api/tasks", { ...edited, date: task.date }))
           .then(() => fetchData()).catch((e) => console.warn("edit-this failed", e));
       } else if (which === "following") {
@@ -354,7 +810,7 @@ export default function App() {
   // just fields on the unified store, patched on the task itself.
   const patchTask = (id, body, warn) => {
     setLocalTasks((prev) => prev.map(t => t.id === id ? { ...t, ...body } : t));
-    fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    apiFetch(`/api/tasks/${encodeURIComponent(id)}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }).catch((e) => console.warn(warn, e));
   };
@@ -432,20 +888,21 @@ export default function App() {
     const all = [...starred, ...bdays, ...events]
       .filter(e => e.date >= todayStr && e.date <= cutoffStr)
       .sort((a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || "")));
-    // Timed items (calendar events + timed month entries) show in the Today timeline,
-    // so keep only untimed reminders/birthdays in the imminent box.
+    // Timed calendar events already sit in the Today timeline, so only untimed
+    // ones join the imminent box. Starred blocks always show: starring is an
+    // explicit "put this in Month ahead", timed or not.
     return {
-      imminent: all.filter(e => !e.start && (e.date === todayStr || e.date === tomorrowStr)),
+      imminent: all.filter(e => (e.date === todayStr || e.date === tomorrowStr) && (!e.start || isStored(e.id))),
       later: all.filter(e => e.date > tomorrowStr),
     };
   }, [localTasks, birthdays, calendarTasks, today]);
 
   if (status === "loading") {
-    return <div style={{ ...S.shell, ...themeVars(profile) }}><style>{globalCss}</style><div style={S.loading}>Connecting to Command Deck…</div></div>;
+    return <div className="cd-shell" style={{ ...S.shell, ...themeVars(theme) }}><style>{globalCss}</style><div style={S.loading}>Connecting to Command Deck…</div></div>;
   }
 
   if (status === "auth") {
-    return <LoginScreen profile={profile} onLogin={login} />;
+    return <LoginScreen profiles={profiles} onLogin={login} />;
   }
 
   const dayProgress = (dateStr) => {
@@ -455,41 +912,44 @@ export default function App() {
   };
 
   return (
-    <div style={{ ...S.shell, ...themeVars(profile) }}>
+    <div className="cd-shell" style={{ ...S.shell, ...themeVars(theme) }}>
       <style>{globalCss}</style>
+      <PullToRefresh color={paletteOf(theme).color} />
 
-      <header style={S.header}>
-        <div>
-          <div style={S.profileBar}>
-            {PROFILE_IDS.map((id) => {
-              const on = id === profile;
-              return (
-                <button key={id} onClick={() => switchProfile(id)}
-                  style={{ ...S.profilePill, ...(on ? { background: profileOf(id).color, color: "#fff", borderColor: profileOf(id).color } : {}) }}
-                  className="cd-push" aria-pressed={on}>
-                  {profileOf(id).name}
-                </button>
-              );
-            })}
+      <header style={S.header} className="cd-header">
+        <div className="cd-header-main">
+          <div style={S.profileBar} className="cd-profile-bar">
+            {profiles.map((p) => (
+              <ProfilePill key={p.id} p={p} on={p.id === activeProfile.id}
+                locked={p.hasPin && p.id !== owner && p.id !== unlocked}
+                onTap={() => switchProfile(p.id)} onLong={() => openSettings(p.id)} />
+            ))}
+            <button onClick={() => setProfilesOpen(true)} style={S.profileManage} className="cd-push"
+              aria-label="Manage profiles" title="Add or edit profiles">+</button>
           </div>
-          <h1 style={S.h1}>Hei, {profileOf(profile).name} 👋</h1>
+          <h1 key={activeProfile.id} style={S.h1} className="cd-swap">Hei, {activeProfile.name} 👋</h1>
         </div>
         <div style={S.headerDate}>
-          <div style={{ ...S.bigDay, color: profileOf(profile).color }}>{today.getDate()}</div>
+          <div style={S.bigDay} className="cd-big-day">{today.getDate()}</div>
           <div style={S.bigMonth}>{MONTHS[today.getMonth()].slice(0,3)} {today.getFullYear()}</div>
         </div>
       </header>
 
+      {updateReady && (
+        <button style={S.updateBar} className="cd-push" onClick={() => window.location.reload()}>
+          ✨ A new version is ready — tap to update
+        </button>
+      )}
       {error && status !== "loading" && (
         <div style={S.errorBanner}>Couldn't reach server — showing last fetch. ({error})</div>
       )}
 
-      <section style={{ ...S.card, ...S.weekCard }} className="cd-card">
+      <section style={{ ...S.card, ...S.weekCard }} className="cd-card cd-week-card">
         <div style={S.cardHead}>
           <h2 style={S.h2}>Next 7 days</h2>
           <button style={S.calOpenBtn} className="cd-push" onClick={() => setCalendarOpen(true)}>📅 Calendar</button>
         </div>
-        <div style={S.weekRow}>
+        <div style={S.weekRow} className="cd-week-row">
           {Array.from({ length: 7 }).map((_, i) => {
             const d = addDays(today, i);
             const dateStr = iso(d);
@@ -500,8 +960,8 @@ export default function App() {
             return (
               <button key={dateStr} onClick={() => setSelectedDate(dateStr)}
                 style={{ ...S.weekDay, ...(active ? S.weekDayActive : {}) }} className="cd-weekday">
-                <div style={S.weekName}>{dname}</div>
-                <div style={{ ...S.weekNum, ...(isTod ? S.weekNumToday : {}) }}>{d.getDate()}</div>
+                <div style={S.weekName} className="cd-week-name">{dname}</div>
+                <div style={{ ...S.weekNum, ...(isTod ? S.weekNumToday : {}) }} className="cd-week-num">{d.getDate()}</div>
                 <div style={S.weekDots}>
                   {ts.slice(0, 5).map((t, j) => (
                     <span key={j} style={{ ...S.weekDot, background: CATS[t.cat].dot, opacity: t.done ? 0.4 : 1 }} />
@@ -514,22 +974,26 @@ export default function App() {
         </div>
       </section>
 
-      <div style={S.grid}>
+      <div style={S.grid} className="cd-grid">
         <section style={{ ...S.card, gridColumn: "1 / 2" }} className="cd-card">
           <div style={S.cardHead}>
             <h2 style={S.h2}>{isToday ? "Today" : DAYS[(selDate.getDay()+6)%7]}</h2>
             <span style={S.cardSub}>{selDate.getDate()} {MONTHS[selDate.getMonth()].slice(0,3)} · {dayProgress(selectedDate)}% done</span>
           </div>
 
-          <Timeline tasks={selectedTasks} isToday={isToday} now={now} onToggle={toggle} onEdit={handleEdit} onMove={moveTask} />
+          <AutoHeight>
+            <Timeline tasks={selectedTasks} isToday={isToday} now={now} hasHome={!!home} onToggle={toggle} onEdit={handleEdit} onMove={moveTask} />
 
-          <AddRow
-            adding={adding} setAdding={setAdding}
-            onAdd={addTask} onAddRecurring={createRecurrence}
-            selectedDate={selectedDate}
-          />
+            <AddRow
+              adding={adding} setAdding={setAdding}
+              onAdd={addTask} onAddRecurring={createRecurrence}
+              selectedDate={selectedDate}
+              places={places} onAddPlace={addPlace} home={home} onSaveHome={saveHome}
+            />
+          </AutoHeight>
         </section>
 
+        <div style={S.sideCol}>
         <section
           style={{ ...S.card, ...S.workoutCard }}
           className="cd-card cd-workout"
@@ -542,6 +1006,7 @@ export default function App() {
             <h2 style={{ ...S.h2, color: "#fff" }}>Next workout</h2>
             <span style={S.woOpen}>Fitness ↗</span>
           </div>
+          <AutoHeight>
           {nextWorkout ? (
             <>
               <div style={S.woTitle}>{nextWorkout.title}</div>
@@ -569,13 +1034,19 @@ export default function App() {
               )}
             </>
           ) : <div style={{ ...S.empty, color: "rgba(255,255,255,0.8)" }}>No upcoming training scheduled.</div>}
+          </AutoHeight>
         </section>
+
+        <TodoCard todos={todos} onAdd={addTodo} onToggle={toggleTodo} onRemove={removeTodo} onClear={clearDoneTodos} />
+        </div>
       </div>
 
-      <div style={S.grid}>
+      <div style={S.grid} className="cd-grid">
         <section style={S.card} className="cd-card">
           <div style={S.cardHead}><h2 style={S.h2}>Month ahead</h2><span style={S.cardSub}>next 30 days</span></div>
-          <MonthList imminent={imminent} later={later} today={today} onAdd={addTask} onRemove={removeTask} onStar={toggleImportant} onShare={toggleShared} />
+          <AutoHeight>
+            <MonthList imminent={imminent} later={later} today={today} onAdd={addTask} onRemove={removeTask} onStar={toggleImportant} onShare={toggleShared} />
+          </AutoHeight>
         </section>
 
         <section style={S.card} className="cd-card">
@@ -585,7 +1056,7 @@ export default function App() {
           </div>
           {weather?.days?.length ? (
             <>
-              <div style={S.wxRow}>
+              <div style={S.wxRow} className="cd-wx-row">
                 {weather.days.map((w) => {
                   const open = w.date === openWeatherDate;
                   return (
@@ -600,7 +1071,9 @@ export default function App() {
                   );
                 })}
               </div>
-              <WeatherDetail day={weather.days.find(d => d.date === openWeatherDate)} />
+              <AutoHeight>
+                <WeatherDetail day={weather.days.find(d => d.date === openWeatherDate)} />
+              </AutoHeight>
             </>
           ) : <div style={S.empty}>Weather unavailable.</div>}
         </section>
@@ -610,7 +1083,31 @@ export default function App() {
         v2 · everything synced via your home server · refreshes every 5 min
       </footer>
 
-      {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} upcoming={upcomingTraining} today={today} profile={profile} onClose={() => setFitnessOpen(false)} />}
+      {fitnessOpen && <FitnessOverlay nextWorkout={nextWorkout} upcoming={upcomingTraining} today={today} profile={profile} allTasks={allTasks} weather={weather} onImport={importTasks} onClose={() => setFitnessOpen(false)} />}
+      {profilesOpen && (
+        <ProfilesOverlay profiles={profiles} active={activeProfile.id} owner={owner}
+          onAdd={async (draft) => { const p = await addProfile(draft); switchProfile(p.id); }}
+          onEdit={openSettings} onClose={() => setProfilesOpen(false)} />
+      )}
+      {settingsFor && profiles.some((p) => p.id === settingsFor) && (
+        <ProfileSettings key={settingsFor} profile={profileIn(profiles, settingsFor)} isOwnDevice={settingsFor === owner}
+          canRemove={profiles.length > 1}
+          onSave={(patch) => updateProfile(settingsFor, patch)}
+          onSetPin={(pin) => setPin(settingsFor, pin)}
+          onSignOutOthers={() => signOutOthers(settingsFor)}
+          onRemove={async () => { await removeProfile(settingsFor); setSettingsFor(null); }}
+          onClose={() => setSettingsFor(null)} />
+      )}
+      {pinPrompt && (
+        <PinPrompt profile={profileIn(profiles, pinPrompt)}
+          onUnlock={(pin, claim) => unlockProfile(pinPrompt, pin, claim)}
+          onCancel={
+            // Tapped a locked pill: cancelling just stays put. The open deck
+            // itself is locked: cancelling moves to a deck that opens freely.
+            pinPrompt !== profile ? () => { pendingSettings.current = null; setPinPrompt(null); }
+              : pinFallback(pinPrompt) && (() => { setPinPrompt(null); switchProfile(pinFallback(pinPrompt)); })
+          } />
+      )}
       {calendarOpen && (
         <CalendarOverlay
           selectedDate={selectedDate} today={today} profile={profile}
@@ -619,7 +1116,7 @@ export default function App() {
         />
       )}
       {editTask && (
-        <EditModal task={editTask} onSave={saveEdit} onDelete={() => { const t = editTask; setEditTask(null); handleDelete(t); }} onClose={() => setEditTask(null)} />
+        <EditModal task={editTask} onSave={saveEdit} onDelete={() => { const t = editTask; setEditTask(null); handleDelete(t); }} onClose={() => setEditTask(null)} places={places} onAddPlace={addPlace} home={home} onSaveHome={saveHome} />
       )}
       {scopePrompt && (
         <ScopePopup
@@ -669,17 +1166,75 @@ const formBand = (f) => {
   return { label: "Fatigued", color: "#d96a8a" };
 };
 
-function FitnessOverlay({ nextWorkout, upcoming, today, profile, onClose }) {
+function FitnessOverlay({ nextWorkout, upcoming, today, profile, allTasks, weather, onImport, onClose }) {
   const [data, setData] = useState(null);
   const [state, setState] = useState("loading"); // loading | ready | error
   const [err, setErr] = useState("");
-  const [detail, setDetail] = useState(null); // null | "power" | "hr"
+  const [detail, setDetail] = useState(null); // null | "power" | "hr" | "coach"
+
+  // Coach prompt panel state. Default to the next two weeks.
+  const [coachStart, setCoachStart] = useState(() => iso(today));
+  const [coachEnd, setCoachEnd] = useState(() => iso(addDays(today, 13)));
+  const [coachNotes, setCoachNotes] = useState("");
+  const [copied, setCopied] = useState(false);
+  const coachPrompt = useMemo(
+    () => (detail === "coach" && data
+      ? buildCoachPrompt({ data, tasks: allTasks, weather, start: coachStart, end: coachEnd, notes: coachNotes })
+      : ""),
+    [detail, data, allTasks, coachStart, coachEnd, coachNotes],
+  );
+  const copyPrompt = async () => {
+    try {
+      await navigator.clipboard.writeText(coachPrompt);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch { /* clipboard blocked — the textarea below is selectable as a fallback */ }
+  };
+
+  // Import sub-panel: paste or load Claude's JSON, preview, then confirm.
+  const [coachTab, setCoachTab] = useState("generate"); // generate | import
+  const [importText, setImportText] = useState("");
+  const [importErr, setImportErr] = useState("");
+  const [importDone, setImportDone] = useState("");
+  const [parsed, setParsed] = useState(null); // { blocks, skipped } | null
+  const [replace, setReplace] = useState(true);
+  const [importing, setImporting] = useState(false);
+
+  const resetImport = (text) => { setImportText(text); setParsed(null); setImportErr(""); setImportDone(""); };
+  const onFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file
+    if (!file) return;
+    try { resetImport(await file.text()); } catch { setImportErr("Couldn't read that file."); }
+  };
+  const doParse = () => {
+    const r = parsePlan(importText);
+    if (r.error) { setImportErr(r.error); setParsed(null); return; }
+    setImportErr(""); setParsed(r);
+  };
+  const doImport = async () => {
+    if (!parsed?.blocks?.length || importing) return;
+    setImporting(true); setImportErr("");
+    try {
+      let replaceRange = null;
+      if (replace) {
+        const ds = parsed.blocks.map((b) => b.date).sort();
+        replaceRange = { start: ds[0], end: ds[ds.length - 1] };
+      }
+      const out = await onImport(parsed.blocks, replaceRange);
+      const n = out?.created?.length ?? parsed.blocks.length;
+      setImportDone(`Added ${n} session${n === 1 ? "" : "s"}${out?.replaced ? ` · replaced ${out.replaced}` : ""}`);
+      setParsed(null); setImportText("");
+    } catch (e) {
+      setImportErr(String(e.message || e));
+    } finally { setImporting(false); }
+  };
 
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const res = await fetch(`/api/fitness?profile=${profile}`);
+        const res = await apiFetch(`/api/fitness?profile=${profile}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const j = await res.json();
         if (alive) { setData(j); setState("ready"); }
@@ -778,7 +1333,10 @@ function FitnessOverlay({ nextWorkout, upcoming, today, profile, onClose }) {
               </div>
             </div>
 
-            <div style={S.ovFootHint}>Workout-plan generator coming next — this is the data it'll use.</div>
+            <button style={S.coachBtn} className="cd-ov-box" onClick={() => setDetail("coach")}>
+              <span>✨ Generate training prompt</span>
+              <span style={S.coachBtnSub}>Build a copy-paste plan request from this data — paste into a Claude chat, no API cost</span>
+            </button>
           </div>
         )}
 
@@ -806,6 +1364,86 @@ function FitnessOverlay({ nextWorkout, upcoming, today, profile, onClose }) {
               pct: hrrPct(z, hr),
             }))}
           />
+        )}
+
+        {detail === "coach" && (
+          <div style={S.ovDetail} className="cd-ov-panel">
+            <div style={S.ovDetailHead}>
+              <button style={S.ovBack} onClick={() => setDetail(null)} className="cd-ov-close" aria-label="Back">‹</button>
+              <div>
+                <h3 style={S.ovDetailTitle}>Training planner</h3>
+                <div style={S.ovDetailSub}>Generate a prompt, then import Claude's plan — no API cost</div>
+              </div>
+            </div>
+            <div style={S.coachTabs}>
+              <button style={{ ...S.coachTab, ...(coachTab === "generate" ? S.coachTabOn : {}) }} onClick={() => setCoachTab("generate")}>1 · Generate prompt</button>
+              <button style={{ ...S.coachTab, ...(coachTab === "import" ? S.coachTabOn : {}) }} onClick={() => setCoachTab("import")}>2 · Import plan</button>
+            </div>
+
+            {coachTab === "generate" && (
+            <div style={S.coachForm}>
+              <div style={S.coachDates}>
+                <label style={S.coachField}>
+                  <span style={S.coachLabel}>Start</span>
+                  <input type="date" value={coachStart} max={coachEnd}
+                    onChange={(e) => setCoachStart(e.target.value)} style={{ ...S.input, boxSizing: "border-box" }} />
+                </label>
+                <label style={S.coachField}>
+                  <span style={S.coachLabel}>End</span>
+                  <input type="date" value={coachEnd} min={coachStart}
+                    onChange={(e) => setCoachEnd(e.target.value)} style={{ ...S.input, boxSizing: "border-box" }} />
+                </label>
+              </div>
+              <label style={S.coachField}>
+                <span style={S.coachLabel}>Notes (optional)</span>
+                <textarea value={coachNotes} onChange={(e) => setCoachNotes(e.target.value)} rows={3}
+                  placeholder="e.g. travelling Fri–Sun · legs feel cooked · easy week · race in 3 weeks…"
+                  style={S.coachNotes} />
+              </label>
+              <div style={S.coachActions}>
+                <button style={S.coachCopy} className="cd-ov-box" onClick={copyPrompt}>{copied ? "Copied ✓" : "Copy prompt"}</button>
+                <span style={S.coachHint}>Review the prompt below before copying</span>
+              </div>
+              <textarea readOnly value={coachPrompt} onFocus={(e) => e.target.select()} style={S.coachOut} />
+            </div>
+            )}
+
+            {coachTab === "import" && (
+            <div style={S.coachForm}>
+              <p style={S.importIntro}>Paste the JSON Claude replied with (the whole message is fine), or load a .json file.</p>
+              <div style={S.coachActions}>
+                <label style={S.fileBtn} className="cd-ov-box">
+                  Choose .json file
+                  <input type="file" accept=".json,application/json,text/plain" onChange={onFile} style={{ display: "none" }} />
+                </label>
+                <span style={S.coachHint}>or paste below</span>
+              </div>
+              <textarea value={importText} onChange={(e) => resetImport(e.target.value)}
+                placeholder={'[{"date":"2026-06-05","start":"06:30","title":"Z2 endurance","sport":"Ride","tss":75,"note":"…"}]'}
+                style={S.coachOut} />
+              {importErr && <div style={S.importErr}>{importErr}</div>}
+              {importDone && <div style={S.importDone}>{importDone} ✓</div>}
+              {!parsed ? (
+                <button style={{ ...S.coachCopy, opacity: importText.trim() ? 1 : 0.5 }} className="cd-ov-box"
+                  onClick={doParse} disabled={!importText.trim()}>Preview plan</button>
+              ) : (
+                <>
+                  <ImportPreview blocks={parsed.blocks} skipped={parsed.skipped} />
+                  <label style={S.replaceRow}>
+                    <input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} />
+                    <span>Replace AI-generated training already in this range</span>
+                  </label>
+                  <div style={S.coachActions}>
+                    <button style={{ ...S.coachCopy, opacity: importing ? 0.6 : 1 }} className="cd-ov-box" onClick={doImport} disabled={importing}>
+                      {importing ? "Adding…" : `Add ${parsed.blocks.length} session${parsed.blocks.length === 1 ? "" : "s"}`}
+                    </button>
+                    <button style={S.fileBtn} className="cd-ov-box" onClick={() => setParsed(null)}>Back to edit</button>
+                  </div>
+                </>
+              )}
+            </div>
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -958,44 +1596,58 @@ function RecoveryChart({ series }) {
   );
 }
 
-function LoginScreen({ profile, onLogin }) {
-  const [who, setWho] = useState(PROFILE_IDS.includes(profile) ? profile : "berge");
+// Nobody is pre-selected: whoever signs in must tap their own name, so a
+// shared/borrowed device can't slide into someone else's deck by default.
+function LoginScreen({ profiles, onLogin }) {
+  const [pick, setWho] = useState(null);
+  const chosen = profiles.find((p) => p.id === pick);
+  const who = chosen?.id ?? null;
   const [code, setCode] = useState("");
-  const [err, setErr] = useState(false);
+  const [pin, setPin] = useState("");
+  const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const hasPin = !!chosen?.hasPin;
+  const ready = who && code && (!hasPin || pin.length >= 4);
 
   const submit = async (e) => {
     if (e) e.preventDefault();
-    if (!code || busy) return;
-    setBusy(true); setErr(false);
-    const ok = await onLogin(code, who);
-    if (!ok) { setErr(true); setBusy(false); setCode(""); }
+    if (!ready || busy) return;
+    setBusy(true); setErr("");
+    const msg = await onLogin(code, who, hasPin ? pin : undefined);
+    if (msg) { setErr(msg); setBusy(false); setPin(""); }
   };
 
   return (
-    <div style={{ ...S.shell, ...themeVars(who), display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+    <div className="cd-shell" style={{ ...S.shell, ...themeVars(chosen?.theme), display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
       <style>{globalCss}</style>
       <form onSubmit={submit} style={S.loginCard}>
         <div style={S.loginKicker}>Command Deck</div>
         <h1 style={S.loginTitle}>Trust this device</h1>
         <p style={S.loginSub}>Pick who’s using it, then enter the passcode once. This device stays signed in.</p>
         <div style={S.loginPills}>
-          {PROFILE_IDS.map((id) => {
-            const on = who === id;
+          {profiles.map((p) => {
+            const on = who === p.id;
+            const c = paletteOf(p.theme).color;
             return (
-              <button type="button" key={id} onClick={() => setWho(id)} aria-pressed={on}
-                style={{ ...S.loginPill, ...(on ? { background: profileOf(id).color, color: "#fff", borderColor: profileOf(id).color } : {}) }}>
-                {profileOf(id).name}
+              <button type="button" key={p.id} onClick={() => { setWho(p.id); setPin(""); setErr(""); }} aria-pressed={on}
+                style={{ ...S.loginPill, ...(on ? { background: c, color: "#fff", borderColor: c } : {}) }}>
+                {p.name}
               </button>
             );
           })}
         </div>
         <input type="password" autoFocus value={code} aria-label="Passcode"
-          onChange={(e) => { setCode(e.target.value); setErr(false); }}
+          onChange={(e) => { setCode(e.target.value); setErr(""); }}
           placeholder="Passcode" style={{ ...S.input, ...(err ? S.loginInputErr : {}) }} />
-        {err && <div style={S.loginErr}>Wrong passcode — try again.</div>}
-        <button type="submit" disabled={!code || busy} style={{ ...S.loginBtn, opacity: !code || busy ? 0.6 : 1 }}>
-          {busy ? "Checking…" : `Enter as ${profileOf(who).name}`}
+        {hasPin && (
+          <input type="password" inputMode="numeric" autoComplete="off" maxLength={6} value={pin}
+            aria-label={`${chosen.name}'s PIN`}
+            onChange={(e) => { setPin(e.target.value.replace(/\D/g, "")); setErr(""); }}
+            placeholder={`${chosen.name}'s PIN`} style={S.input} />
+        )}
+        {err && <div style={S.loginErr}>{err}</div>}
+        <button type="submit" disabled={!ready || busy} style={{ ...S.loginBtn, opacity: !ready || busy ? 0.6 : 1 }}>
+          {busy ? "Checking…" : (chosen ? `Enter as ${chosen.name}` : "Tap your name above")}
         </button>
       </form>
     </div>
@@ -1024,7 +1676,7 @@ function CalendarOverlay({ selectedDate, today, profile, onPick, onClose }) {
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    fetch(`/api/data?start=${iso(gridStart)}&days=42&profile=${profile}`)
+    apiFetch(`/api/data?start=${iso(gridStart)}&days=42&profile=${profile}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((d) => {
         if (!alive) return;
@@ -1086,30 +1738,170 @@ function CalendarOverlay({ selectedDate, today, profile, onPick, onClose }) {
   );
 }
 
-function Timeline({ tasks, isToday, now, onToggle, onEdit, onMove }) {
+// --- Commute chaining ------------------------------------------------------
+// One Location per event. locOf: "" = home (default), a place id = away,
+// null/undefined (calendar/birthday rows) = transparent (doesn't move you).
+// Travel legs are derived from location *changes*: an arrive-by leg before a
+// committed away event, a depart-based leg on the way home. Same place twice in
+// a row → no travel (you stay put).
+const locOf = (t) => (t.location == null ? null : (t.location === "" ? "home" : t.location));
+const isoLocal = (date, hhmm) => { const d = new Date(`${date}T${hhmm}`); return isNaN(+d) ? null : d.toISOString(); };
+
+function planDay(tasks, hasHome) {
+  const legs = [];
+  const seq = [];
+  let cur = "home";
+  let awayEnd = null;   // ISO end-time of the away event we're currently at
+  let lastAwayIdx = -1; // index in seq of the last away task
+
+  tasks.forEach((t) => {
+    const loc = locOf(t);
+    if (loc === null) { seq.push({ kind: "task", t }); return; }
+
+    if (loc !== cur && hasHome) {
+      if (loc === "home") {
+        if (awayEnd) {
+          const key = `${cur}>home@d:${awayEnd}`;
+          const leg = { kind: "travel", dir: "out", key, from: cur, to: "home", departAt: awayEnd };
+          seq.push(leg); legs.push(leg);
+        }
+      } else {
+        const arr = t.start ? isoLocal(t.date, t.start) : null;
+        if (arr) {
+          const key = `${cur}>${loc}@a:${arr}`;
+          const leg = { kind: "travel", dir: "in", key, from: cur, to: loc, arriveBy: arr };
+          seq.push(leg); legs.push(leg);
+        }
+      }
+    }
+    cur = loc;
+    seq.push({ kind: "task", t });
+    if (loc !== "home") { awayEnd = t.end ? isoLocal(t.date, t.end) : awayEnd; lastAwayIdx = seq.length - 1; }
+  });
+
+  // End of day: still away after the last located event → head home.
+  if (cur !== "home" && hasHome && awayEnd && lastAwayIdx >= 0) {
+    const key = `${cur}>home@d:${awayEnd}`;
+    const leg = { kind: "travel", dir: "out", key, from: cur, to: "home", departAt: awayEnd };
+    seq.splice(lastAwayIdx + 1, 0, leg); legs.push(leg);
+  }
+  return { legs, seq };
+}
+
+// Insert free-time breathers between consecutive task rows, subtracting travel
+// time so the figure is honest. Arrive-by legs put the breather before the trip
+// (free at the origin); homeward legs put it after (free once you're home).
+function buildRows(seq, tripOf) {
+  const rows = [];
+  for (let i = 0; i < seq.length; i++) {
+    const it = seq[i];
+    if (it.kind !== "task") { rows.push(it); continue; }
+    rows.push(it);
+    let j = i + 1; const between = [];
+    while (j < seq.length && seq[j].kind !== "task") { between.push(seq[j]); j++; }
+    if (j >= seq.length) continue;
+    const eA = hm(it.t.end), sB = hm(seq[j].t.start);
+    if (eA == null || sB == null) continue;
+    let tMin = 0, dir = null;
+    for (const leg of between) { dir = leg.dir; const tr = tripOf(leg.key); if (tr) tMin += tr.durationMin; }
+    const free = sB - eA - tMin;
+    if (free < 15) continue;
+    if (dir === "out") {
+      for (const leg of between) rows.push(leg);
+      rows.push({ kind: "gap", from: eA + tMin, to: sB, mins: free });
+      i = j - 1; // between rows already emitted
+    } else {
+      rows.push({ kind: "gap", from: eA, to: eA + free, mins: free });
+    }
+  }
+  return rows;
+}
+
+// Smoothly animates a section's height when its content changes size — on
+// add/remove of items and on profile switch. Observes the inner (natural)
+// content height and tweens the outer box via the Web Animations API, which
+// works on every modern browser incl. iPad Safari (CSS can't transition
+// height:auto without Chrome-only interpolate-size). Overflow is clipped only
+// mid-animation, so resting hover-lifts aren't cut. Width-driven (responsive)
+// reflow snaps without a tween. Honors prefers-reduced-motion.
+function AutoHeight({ children, style, duration = 320 }) {
+  const outer = useRef(null);
+  const inner = useRef(null);
+  const last = useRef(null);   // { h, w } of the last settled content size
+  const anim = useRef(null);
+
+  useLayoutEffect(() => {
+    const innerEl = inner.current, outerEl = outer.current;
+    if (!innerEl || !outerEl || typeof ResizeObserver === "undefined") return;
+    const reduce = typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const ro = new ResizeObserver(() => {
+      const h = innerEl.offsetHeight, w = innerEl.offsetWidth;
+      if (last.current === null) { last.current = { h, w }; return; }
+      if (h === last.current.h) { last.current.w = w; return; }
+      const from = last.current.h, widthChanged = w !== last.current.w;
+      last.current = { h, w };
+      if (reduce || widthChanged) return; // don't tween a responsive reflow
+      if (anim.current) anim.current.cancel();
+      outerEl.style.overflow = "hidden";
+      const a = outerEl.animate(
+        [{ height: from + "px" }, { height: h + "px" }],
+        { duration, easing: "cubic-bezier(.2,.8,.25,1)" }
+      );
+      anim.current = a;
+      const settle = () => { if (anim.current === a) { outerEl.style.overflow = ""; anim.current = null; } };
+      a.onfinish = settle; a.oncancel = settle;
+    });
+    ro.observe(innerEl);
+    return () => { ro.disconnect(); if (anim.current) anim.current.cancel(); };
+  }, [duration]);
+
+  return (
+    <div ref={outer} style={style}>
+      <div ref={inner}>{children}</div>
+    </div>
+  );
+}
+
+function Timeline({ tasks, isToday, now, hasHome, onToggle, onEdit, onMove }) {
+  const plan = useMemo(() => planDay(tasks, hasHome), [tasks, hasHome]);
+  const [trips, setTrips] = useState({}); // leg key -> trip | null (no route) | undefined (loading)
+  const requested = useRef(new Set());
+
+  // Hoisted travel fetch: one request per leg (deduped), so breathers can
+  // subtract travel time and the whole timeline shares one source of truth.
+  useEffect(() => {
+    let alive = true;
+    for (const leg of plan.legs) {
+      if (requested.current.has(leg.key)) continue;
+      requested.current.add(leg.key);
+      const qs = new URLSearchParams({ from: leg.from, to: leg.to });
+      if (leg.arriveBy) qs.set("arriveBy", leg.arriveBy);
+      if (leg.departAt) qs.set("departAt", leg.departAt);
+      apiFetch(`/api/travel?${qs.toString()}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (alive) setTrips((prev) => ({ ...prev, [leg.key]: d?.trip ?? null })); })
+        .catch(() => { if (alive) setTrips((prev) => ({ ...prev, [leg.key]: null })); });
+    }
+    return () => { alive = false; };
+  }, [plan]);
+
   if (!tasks.length) {
     return <div style={S.tlEmpty}>Nothing scheduled. Tap <b>+ Add block</b> to shape your day.</div>;
   }
   const nowMin = now.getHours() * 60 + now.getMinutes();
-
-  // Interleave free-time nudges between consecutive timed blocks (Structured-style).
-  const rows = [];
-  tasks.forEach((t, i) => {
-    rows.push({ kind: "task", t });
-    const next = tasks[i + 1];
-    const end = hm(t.end), nStart = next && hm(next.start);
-    if (end != null && nStart != null && nStart - end >= 15) {
-      rows.push({ kind: "gap", from: end, to: nStart, mins: nStart - end });
-    }
-  });
+  const rows = buildRows(plan.seq, (key) => trips[key]);
 
   return (
     <div style={S.timeline}>
       {rows.map((r, idx) => {
+        if (r.kind === "travel") {
+          return <TravelRow key={r.key} trip={trips[r.key]} dir={r.dir} isToday={isToday} now={now} />;
+        }
         if (r.kind === "gap") {
           const nowHere = isToday && nowMin >= r.from && nowMin < r.to;
           return (
-            <div key={`gap-${idx}`} style={S.tlGapRow}>
+            <div key={`gap-${idx}`} style={S.tlGapRow} className="cd-tl-row">
               <div style={S.tlTime} />
               <div style={S.tlSpine}><div style={S.tlLineDash} /></div>
               <div style={S.tlGap}>
@@ -1135,7 +1927,7 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onMove }) {
         const editable = stored || t.recurring;
 
         return (
-          <div key={t.id} style={S.tlRow} className="cd-row">
+          <div key={t.id} style={S.tlRow} className="cd-row cd-tl-row">
             <div style={S.tlTime}>
               <div style={inProgress ? S.tlNowTime : null}>{t.start || "all-day"}</div>
               {t.end ? <div style={S.tlTimeEnd}>{t.end}</div> : null}
@@ -1166,7 +1958,7 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onMove }) {
                     <span style={{ ...S.tlTitle, textDecoration: t.done ? "line-through" : "none" }}>{t.title}</span>
                   </div>
                   {inProgress
-                    ? <div style={S.tlRemaining}>{end - nowMin} min remaining</div>
+                    ? <div style={S.tlRemaining}>{fmtRange(end - nowMin)} remaining</div>
                     : (t.note ? <div style={S.tlNote}>{t.note}</div> : null)}
                   {!inProgress && (
                     <span style={{ ...S.tag, color: c.dot }}>{c.label}{t.important ? " · ★" : ""}{t.recurring ? " · ↻" : ""}{t.shared ? " · 🔗" : ""}</span>
@@ -1189,6 +1981,55 @@ function Timeline({ tasks, isToday, now, onToggle, onEdit, onMove }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// Non-completable timeline row: a conservative public-transport estimate, prose
+// only (no route, by design). `trip` is supplied by the Timeline (undefined =
+// loading, null = no route). Inbound legs (arrive-by) lead with a live "leave in
+// N min" countdown; homeward legs lead with the arrival ("🏠 Home by ~X"), since
+// the realistic question on the way home is when you'll get there, not the minute
+// you leave.
+function TravelRow({ trip, dir, isToday, now }) {
+  if (trip === null) return null;
+  const inbound = dir === "in";
+  const leaving = trip?.start ? trip.start.slice(11, 16) : "";   // ISO carries local offset
+  const arriving = trip?.end ? trip.end.slice(11, 16) : "";
+
+  let countdown = null;
+  if (trip && isToday && inbound) {
+    const mins = Math.round((Date.parse(trip.start) - now.getTime()) / 60000);
+    if (mins >= 0 && mins <= 180) countdown = mins;
+  }
+
+  return (
+    <div style={S.tlTravelRow} className="cd-tl-row">
+      <div style={S.tlTime}>{leaving || "—"}</div>
+      <div style={S.tlSpine}>
+        <div style={S.tlLineDash} />
+        <div style={S.tlTravelBadge}>🚆</div>
+      </div>
+      <div style={S.tlTravelBlock}>
+        {trip === undefined ? (
+          <span style={S.tlTravelMuted}>Estimating travel…</span>
+        ) : inbound ? (
+          <>
+            <span style={S.tlTravelMain}>
+              {countdown != null
+                ? (countdown === 0 ? "Leave now" : `Leave in ${countdown} min`)
+                : `Leave by ${leaving}`}
+            </span>
+            <span style={S.tlTravelSub}>~{trip.durationMin} min · arrive {arriving}</span>
+          </>
+        ) : (
+          <>
+            <span style={S.tlTravelMain}>🏠 Home by ~{arriving}</span>
+            <span style={S.tlTravelSub}>~{trip.durationMin} min · leave ~{leaving}</span>
+          </>
+        )}
+      </div>
+      <div />
     </div>
   );
 }
@@ -1218,7 +2059,109 @@ function FuelChip({ icon, n, label }) {
   );
 }
 
-function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
+// Single "where does this happen" picker. Default 🏠 Home (value ""); other
+// options are saved places. "+ Add place…" swaps to a label+address mini-form
+// that geocodes + saves via onAddPlace, then selects it — so places are managed
+// right where they're used, no settings screen. The timeline derives all travel
+// by chaining these locations (stay if unchanged, return home at the end).
+function LocationSelect({ value, places, onChange, onAddPlace }) {
+  const [adding, setAdding] = useState(false);
+  const [lab, setLab] = useState("");
+  const [addr, setAddr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const onSelect = (e) => {
+    if (e.target.value === "__add__") { setAdding(true); return; }
+    onChange(e.target.value);
+  };
+  const saveNew = async () => {
+    if (!lab.trim() || !addr.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      const created = await onAddPlace(lab.trim(), addr.trim());
+      onChange(created.id);
+      setAdding(false); setLab(""); setAddr("");
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  if (adding) {
+    return (
+      <div style={S.placeAdd}>
+        <input autoFocus placeholder="Label (e.g. Work)" value={lab} onChange={(e)=>setLab(e.target.value)} style={S.input} />
+        <input placeholder="Address (e.g. Sandslikroken 140, Bergen)" value={addr} onChange={(e)=>setAddr(e.target.value)} style={S.input} />
+        {err && <div style={S.placeErr}>{err}</div>}
+        <div style={S.addActions}>
+          <button style={S.cancelBtn} onClick={() => { setAdding(false); setErr(""); }}>Cancel</button>
+          <button style={S.saveBtn} disabled={busy || !lab.trim() || !addr.trim()} onClick={saveNew}>{busy ? "Saving…" : "Save place"}</button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={S.travelField}>
+      <span style={S.travelLabel}>At</span>
+      <select value={value || ""} onChange={onSelect} style={{ ...S.input, flex: 1 }}>
+        <option value="">🏠 Home</option>
+        {places.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+        <option value="__add__">+ Add place…</option>
+      </select>
+    </div>
+  );
+}
+
+// The dedicated Home anchor. Set once; shows as a small editable line afterwards.
+// When unset it prompts inline (travel can't route home until it's set).
+function HomeField({ home, onSaveHome }) {
+  const [editing, setEditing] = useState(false);
+  const [addr, setAddr] = useState(home?.address || "");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const save = async () => {
+    if (!addr.trim()) return;
+    setBusy(true); setErr("");
+    try { await onSaveHome(addr.trim()); setEditing(false); }
+    catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  if (editing || !home) {
+    return (
+      <div style={S.placeAdd}>
+        {!home && <div style={S.travelHint}>Set your home address so commutes can route home.</div>}
+        <input autoFocus={!!editing} placeholder="Home address (e.g. Nattlandsveien 64, Bergen)"
+          value={addr} onChange={(e)=>setAddr(e.target.value)} style={S.input} />
+        {err && <div style={S.placeErr}>{err}</div>}
+        <div style={S.addActions}>
+          {home && <button style={S.cancelBtn} onClick={() => { setEditing(false); setErr(""); setAddr(home.address); }}>Cancel</button>}
+          <button style={S.saveBtn} disabled={busy || !addr.trim()} onClick={save}>{busy ? "Saving…" : "Save home"}</button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={S.homeLine}>
+      <span>🏠 Home · {home.address}</span>
+      <button style={S.homeEdit} onClick={() => { setAddr(home.address); setEditing(true); }}>edit</button>
+    </div>
+  );
+}
+
+// Location + home, shared by the add + edit forms. Pick a non-home location and
+// a public-transport estimate appears in the daily timeline.
+function TravelFields({ location, setLocation, places, onAddPlace, home, onSaveHome }) {
+  return (
+    <div style={S.travelBox}>
+      <div style={S.travelHead}>📍 Location <span style={S.travelHint}>(for travel estimates)</span></div>
+      <LocationSelect value={location} places={places} onChange={setLocation} onAddPlace={onAddPlace} />
+      <HomeField home={home} onSaveHome={onSaveHome} />
+    </div>
+  );
+}
+
+function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate, places, onAddPlace, home, onSaveHome }) {
   const defaultWd = ((new Date(selectedDate + "T00:00:00").getDay()) + 6) % 7;
   const [title, setTitle] = useState("");
   const [start, setStart] = useState("08:00");
@@ -1234,6 +2177,7 @@ function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
   const [count, setCount] = useState("");
   const [shared, setShared] = useState(false);
   const [important, setImportant] = useState(false);
+  const [location, setLocation] = useState("");
 
   if (!adding) {
     return <button style={S.addBtn} onClick={() => setAdding(true)} className="cd-add">+ Add block</button>;
@@ -1243,11 +2187,11 @@ function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
   const unit = freq === "daily" ? "day(s)" : freq === "weekly" ? "week(s)" : "month(s)";
   const invalidEnd = freq !== "none" && ((endMode === "until" && !until) || (endMode === "count" && !count));
 
-  const reset = () => { setTitle(""); setEnd(""); setNote(""); setTss(""); setFreq("none"); setIntervalN(1); setEndMode("never"); setUntil(""); setCount(""); setShared(false); setImportant(false); setAdding(false); };
+  const reset = () => { setTitle(""); setEnd(""); setNote(""); setTss(""); setFreq("none"); setIntervalN(1); setEndMode("never"); setUntil(""); setCount(""); setShared(false); setImportant(false); setLocation(""); setAdding(false); };
 
   const submit = () => {
     if (!title.trim()) return;
-    const base = { title: title.trim(), start, end, cat, note: note.trim(), shared, tss: cat === "training" && tss ? Number(tss) : null };
+    const base = { title: title.trim(), start, end, cat, note: note.trim(), shared, tss: cat === "training" && tss ? Number(tss) : null, location };
     if (freq === "none") {
       onAdd({ ...base, important });
     } else {
@@ -1280,6 +2224,8 @@ function AddRow({ adding, setAdding, onAdd, onAddRecurring, selectedDate }) {
           </button>
         ))}
       </div>
+
+      <TravelFields location={location} setLocation={setLocation} places={places} onAddPlace={onAddPlace} home={home} onSaveHome={onSaveHome} />
 
       <div style={S.repeatRow}>
         <span style={S.repeatLabel}>↻ Repeat</span>
@@ -1348,9 +2294,432 @@ function SharedToggle({ shared, onToggle }) {
   return (
     <button type="button" onClick={onToggle} aria-pressed={shared}
       style={{ ...S.shareToggle, ...(shared ? S.shareToggleOn : {}) }}
-      title="Shared events show on both Berge's and Amanda's deck">
-      <span>🔗</span>{shared ? "Shared with both decks" : "Make shared (both decks)"}
+      title="Shared events show on every profile's deck">
+      <span>🔗</span>{shared ? "Shared with every deck" : "Make shared (every deck)"}
     </button>
+  );
+}
+
+// Asks for a profile's PIN before opening its deck. "Don't ask again" makes
+// this device that profile's own (it then opens freely here).
+function PinPrompt({ profile, onUnlock, onCancel }) {
+  const [pin, setPin] = useState("");
+  const [claim, setClaim] = useState(false);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!onCancel) return;
+    const onKey = (e) => { if (e.key === "Escape") onCancel(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (pin.length < 4 || busy) return;
+    setBusy(true); setErr("");
+    try { await onUnlock(pin, claim); }
+    catch (x) { setErr(String(x.message || x)); setPin(""); setBusy(false); }
+  };
+
+  const c = paletteOf(profile.theme).color;
+  return (
+    <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onCancel || undefined}>
+      <form onSubmit={submit} style={{ ...S.scopePanel, textAlign: "left" }} className="cd-ov-panel" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+        <h3 style={S.scopeTitle}>🔒 {profile.name}</h3>
+        <p style={S.scopeText}>Enter {profile.name}'s PIN to open their deck.</p>
+        <input type="password" inputMode="numeric" autoComplete="off" autoFocus maxLength={6} value={pin}
+          onChange={(e) => { setPin(e.target.value.replace(/\D/g, "")); setErr(""); }}
+          placeholder="PIN" aria-label="PIN" style={{ ...S.input, ...S.pinInput, ...(err ? S.loginInputErr : {}) }} />
+        {err && <div style={{ ...S.loginErr, marginTop: 8 }}>{err}</div>}
+        <label style={S.pinClaim}>
+          <input type="checkbox" checked={claim} onChange={(e) => setClaim(e.target.checked)} style={{ accentColor: c }} />
+          Don't ask again on this device (make it {profile.name}'s)
+        </label>
+        <button type="submit" disabled={pin.length < 4 || busy}
+          style={{ ...S.loginBtn, width: "100%", background: c, opacity: pin.length < 4 || busy ? 0.6 : 1 }}>
+          {busy ? "Checking…" : "Unlock"}
+        </button>
+        {onCancel && <button type="button" style={S.scopeCancel} onClick={onCancel}>Cancel</button>}
+      </form>
+    </div>
+  );
+}
+
+// Everyday reminders: a plain checklist per profile. Open items first, ticked
+// ones sink to the bottom (struck through) until "Clear done".
+function TodoCard({ todos, onAdd, onToggle, onRemove, onClear }) {
+  const [text, setText] = useState("");
+  const open = todos.filter((t) => !t.done);
+  const done = todos.filter((t) => t.done);
+
+  const submit = (e) => {
+    e.preventDefault();
+    const title = text.trim();
+    if (!title) return;
+    onAdd(title);
+    setText("");
+  };
+
+  return (
+    <section style={S.card} className="cd-card">
+      <div style={S.cardHead}>
+        <h2 style={S.h2}>To-do</h2>
+        {done.length > 0
+          ? <button type="button" onClick={onClear} style={S.todoClear}>Clear done ({done.length})</button>
+          : <span style={S.cardSub}>{open.length ? `${open.length} left` : ""}</span>}
+      </div>
+      <AutoHeight>
+        {todos.length === 0 && <div style={S.empty}>Nothing to remember. Add a small reminder below.</div>}
+        <div style={S.todoList}>
+          {[...open, ...done].map((t) => (
+            <div key={t.id} style={S.todoRow} className="cd-row">
+              <button type="button" onClick={() => onToggle(t)} aria-pressed={!!t.done} aria-label={t.done ? "Mark not done" : "Mark done"}
+                style={{ ...S.todoBox, ...(t.done ? S.todoBoxOn : {}) }}>{t.done ? "✓" : ""}</button>
+              <span onClick={() => onToggle(t)} style={{ ...S.todoTitle, ...(t.done ? S.todoTitleDone : {}) }}>{t.title}</span>
+              <button type="button" onClick={() => onRemove(t)} style={S.todoDel} aria-label={`Remove ${t.title}`}>×</button>
+            </div>
+          ))}
+        </div>
+        <form onSubmit={submit} style={S.todoAdd}>
+          <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Add a to-do…" maxLength={200}
+            style={S.input} aria-label="New to-do" />
+          <button type="submit" disabled={!text.trim()} style={{ ...S.saveBtn, opacity: text.trim() ? 1 : 0.5 }}>Add</button>
+        </form>
+      </AutoHeight>
+    </section>
+  );
+}
+
+const CAL_LABELS = [["training", "Training"], ["work", "Work"], ["social", "Social"], ["home", "Home"], ["event", "Events"]];
+
+// Pull-to-refresh for the home-screen app. Browser tabs (Safari, Chrome) have
+// their own, but a standalone home-screen app has none, so draw one there only.
+// Pulling down from the very top past PULL_TRIGGER reloads the page: fresh data
+// and, after a deploy, fresh app code.
+const PULL_TRIGGER = 70; // px of (damped) pull needed to refresh
+const PULL_MAX = 110;
+const PULL_SLIDE = 0.6; // the page follows the finger at this fraction of the pull
+const isStandalone = () =>
+  window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true;
+
+function PullToRefresh({ color }) {
+  const [pull, setPull] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    if (!isStandalone()) return;
+    let startY = null, startX = 0, dist = 0;
+    // Slide the page with the finger, like a native pull. Written straight to
+    // the DOM (no re-render per touchmove); cleared when idle so the shell never
+    // keeps a transform (that would re-anchor its position:fixed children).
+    const shell = () => document.querySelector(".cd-shell");
+    const slide = (px, animate) => {
+      const el = shell(); if (!el) return;
+      el.style.transition = animate ? "transform .25s ease" : "none";
+      el.style.transform = px ? `translateY(${px}px)` : "";
+      // Hand `transition` back to the stylesheet (it animates profile-colour switches).
+      if (!px) setTimeout(() => { if (!el.style.transform) el.style.transition = ""; }, 300);
+    };
+    const reset = () => { startY = null; if (dist) { dist = 0; setPull(0); slide(0, true); } };
+    const onStart = (e) => {
+      // Only from the top of the page, one finger, and not inside a sheet.
+      if (window.scrollY > 0 || e.touches.length !== 1 || e.target.closest?.(".cd-ov-backdrop")) { startY = null; return; }
+      startY = e.touches[0].clientY; startX = e.touches[0].clientX; dist = 0;
+    };
+    const onMove = (e) => {
+      if (startY === null) return;
+      const dy = e.touches[0].clientY - startY, dx = e.touches[0].clientX - startX;
+      // Scrolling up, or a sideways swipe (e.g. the profile names): not a pull.
+      if (dy < 0 || (!dist && Math.abs(dx) > 8 && Math.abs(dx) > dy)) { reset(); return; }
+      if (dy < 6) return;
+      e.preventDefault(); // stop the page's own rubber-band while pulling
+      dist = Math.min(PULL_MAX, dy * 0.5);
+      setPull(dist);
+      slide(dist * PULL_SLIDE, false);
+    };
+    const onEnd = () => {
+      if (startY === null) return;
+      startY = null;
+      if (dist >= PULL_TRIGGER) {
+        setRefreshing(true);
+        setPull(PULL_TRIGGER);
+        navigator.vibrate?.(10);
+        window.location.reload();
+      } else reset();
+    };
+    window.addEventListener("touchstart", onStart, { passive: true });
+    window.addEventListener("touchmove", onMove, { passive: false });
+    window.addEventListener("touchend", onEnd);
+    window.addEventListener("touchcancel", reset);
+    return () => {
+      window.removeEventListener("touchstart", onStart);
+      window.removeEventListener("touchmove", onMove);
+      window.removeEventListener("touchend", onEnd);
+      window.removeEventListener("touchcancel", reset);
+    };
+  }, []);
+
+  if (!pull && !refreshing) return null;
+  const ready = pull >= PULL_TRIGGER;
+  // Portalled to <body>: inside the sliding page it would slide along with it.
+  // Centred in the gap that opens above the page.
+  const gap = pull * PULL_SLIDE;
+  return createPortal(
+    <div style={{ ...S.ptr, transform: `translate(-50%, ${gap / 2 - 20}px)`, opacity: Math.min(1, pull / 40) }}
+      role="status" aria-label={refreshing ? "Refreshing" : ready ? "Release to refresh" : "Pull to refresh"}>
+      <span className={refreshing ? "cd-ptr-spin" : ""}
+        style={{ ...S.ptrIcon, transform: refreshing ? undefined : `rotate(${ready ? 180 : (pull / PULL_TRIGGER) * 180}deg)`,
+                 color: ready || refreshing ? color : faint }}>
+        {refreshing ? "↻" : "↓"}
+      </span>
+    </div>,
+    document.body,
+  );
+}
+
+// Swallow the one click the browser sends when a held finger lifts. By then
+// the long-press has opened a sheet, so that click would land on the sheet's
+// backdrop and close it straight away.
+const swallowNextClick = () => {
+  const stop = (e) => { e.stopPropagation(); e.preventDefault(); };
+  window.addEventListener("click", stop, { capture: true, once: true });
+  setTimeout(() => window.removeEventListener("click", stop, { capture: true }), 800);
+};
+
+// Press-and-hold (touch) or right-click (mouse) → onLong; a normal tap → onTap.
+function useLongPress(onLong, onTap, ms = 480) {
+  const timer = useRef(null);
+  const fired = useRef(false);
+  const origin = useRef(null);
+  const clear = () => { clearTimeout(timer.current); timer.current = null; };
+  const fire = () => { clear(); fired.current = true; navigator.vibrate?.(10); onLong(); };
+  const fireHeld = () => { swallowNextClick(); fire(); };
+  return {
+    onPointerDown: (e) => {
+      fired.current = false;
+      if (e.button !== 0) return;
+      origin.current = [e.clientX, e.clientY];
+      clear();
+      timer.current = setTimeout(fireHeld, ms);
+    },
+    onPointerMove: (e) => {
+      if (timer.current && Math.hypot(e.clientX - origin.current[0], e.clientY - origin.current[1]) > 10) clear();
+    },
+    onPointerUp: clear, onPointerLeave: clear, onPointerCancel: clear,
+    onContextMenu: (e) => { e.preventDefault(); if (!fired.current) fire(); },
+    onClick: (e) => { if (fired.current) { e.preventDefault(); fired.current = false; return; } onTap(); },
+  };
+}
+
+function ProfilePill({ p, on, locked, onTap, onLong }) {
+  const press = useLongPress(onLong, onTap);
+  const c = paletteOf(p.theme).color;
+  return (
+    <button {...press} style={{ ...S.profilePill, ...(on ? { background: c, color: "#fff", borderColor: c } : {}) }}
+      className="cd-push cd-nosel" aria-pressed={on} title="Hold for settings">
+      {p.name}{locked && <span style={S.pillLock} aria-label="PIN protected">🔒</span>}
+    </button>
+  );
+}
+
+const useEscape = (onClose) => useEffect(() => {
+  const onKey = (e) => { if (e.key === "Escape") onClose(); };
+  window.addEventListener("keydown", onKey);
+  return () => window.removeEventListener("keydown", onKey);
+}, [onClose]);
+
+// The "+" sheet: every profile (tap one to edit it) and a form to add another.
+function ProfilesOverlay({ profiles, active, owner, onAdd, onEdit, onClose }) {
+  const [name, setName] = useState("");
+  const [theme, setTheme] = useState(() => Object.keys(PALETTES).find((k) => !profiles.some((p) => p.theme === k)) || "denim");
+  const [showCals, setShowCals] = useState(false);
+  const [cals, setCals] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEscape(onClose);
+
+  const add = async (e) => {
+    e.preventDefault();
+    if (!name.trim() || busy) return;
+    setBusy(true); setErr("");
+    try { await onAdd({ name: name.trim(), theme, calendars: cals }); onClose(); }
+    catch (x) { setErr(String(x.message || x)); setBusy(false); }
+  };
+
+  return (
+    <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onClose}>
+      <div style={{ ...S.ovPanel, maxWidth: 440, textAlign: "left" }} className="cd-ov-panel" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+        <div style={S.ovHead}>
+          <h2 style={S.ovTitle}>Profiles</h2>
+          <button style={S.ovClose} className="cd-ov-close" onClick={onClose} aria-label="Close">×</button>
+        </div>
+
+        <div style={S.pfList}>
+          {profiles.map((p) => {
+            const n = p.calendars?.length || 0;
+            const tags = [
+              n ? `${n} Google calendar${n > 1 ? "s" : ""}` : "No Google calendars",
+              p.hasPin && "🔒 PIN",
+              p.id === owner && "this device's profile",
+            ].filter(Boolean).join(" · ");
+            return (
+              <button key={p.id} type="button" style={S.pfRowBtn} className="cd-push" onClick={() => onEdit(p.id)}>
+                <span style={{ ...S.pfSwatch, background: paletteOf(p.theme).color }} />
+                <span style={{ minWidth: 0 }}>
+                  <span style={S.pfName}>{p.name}{p.id === active && <span style={S.pfYou}> · open now</span>}</span>
+                  <span style={S.pfMeta}>{tags}</span>
+                </span>
+                <span style={S.pfChevron}>›</span>
+              </button>
+            );
+          })}
+        </div>
+        <div style={S.pfTip}>Tip: press and hold a name at the top of the page to open its settings.</div>
+
+        <form onSubmit={add} style={S.addPanel}>
+          <div style={S.pfFormHead}>Add a profile</div>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" maxLength={30}
+            style={S.input} aria-label="Profile name" />
+          <ThemePicker value={theme} onChange={setTheme} />
+          <button type="button" onClick={() => setShowCals((v) => !v)} style={S.pfCalToggle}>
+            {showCals ? "▾" : "▸"} Google calendars (optional)
+          </button>
+          {showCals && (
+            <>
+              <div style={S.pfHint}>Paste each calendar's “Secret address in iCal format” from Google Calendar settings.</div>
+              {CAL_LABELS.map(([cat, label]) => (
+                <input key={cat} value={cals[cat] || ""} onChange={(e) => setCals((c) => ({ ...c, [cat]: e.target.value }))}
+                  placeholder={`${label} — https://calendar.google.com/…/basic.ics`} style={S.input} aria-label={`${label} calendar URL`} />
+              ))}
+            </>
+          )}
+          {err && <div style={S.loginErr}>{err}</div>}
+          <div style={S.addActions}>
+            <button type="submit" disabled={!name.trim() || busy}
+              style={{ ...S.saveBtn, background: paletteOf(theme).color, opacity: !name.trim() || busy ? 0.6 : 1 }}>
+              {busy ? "Saving…" : "Add profile"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function ThemePicker({ value, onChange }) {
+  return (
+    <div style={S.pfThemes}>
+      {Object.entries(PALETTES).map(([key, pal]) => (
+        <button type="button" key={key} onClick={() => onChange(key)} aria-pressed={value === key} aria-label={key} title={key}
+          style={{ ...S.pfTheme, background: pal.color, boxShadow: value === key ? `0 0 0 2px ${cardBg}, 0 0 0 4px ${pal.color}` : "none" }} />
+      ))}
+    </div>
+  );
+}
+
+// One profile's settings: name, colour, PIN, signing other devices out, removal.
+function ProfileSettings({ profile, isOwnDevice, canRemove, onSave, onSetPin, onSignOutOthers, onRemove, onClose }) {
+  const [name, setName] = useState(profile.name);
+  const [theme, setTheme] = useState(profile.theme);
+  const [pinEdit, setPinEdit] = useState(null); // null = closed, string = new PIN being typed
+  const [armed, setArmed] = useState(null);     // "signout" | "remove" awaiting a second tap
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [note, setNote] = useState("");
+  useEscape(onClose);
+
+  const run = async (fn, done) => {
+    setBusy(true); setErr(""); setNote("");
+    try { await fn(); if (done) setNote(done); } catch (x) { setErr(String(x.message || x)); }
+    setBusy(false); setArmed(null);
+  };
+  const dirty = name.trim() && (name.trim() !== profile.name || theme !== profile.theme);
+  const pinOk = /^\d{4,6}$/.test(pinEdit || "");
+  const c = paletteOf(theme).color;
+
+  return (
+    <div style={S.ovBackdrop} className="cd-ov-backdrop" onClick={onClose}>
+      <div style={{ ...S.ovPanel, maxWidth: 440, textAlign: "left", ...themeVars(theme) }} className="cd-ov-panel" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+        <div style={S.ovHead}>
+          <h2 style={S.ovTitle}>{profile.name}</h2>
+          <button style={S.ovClose} className="cd-ov-close" onClick={onClose} aria-label="Close">×</button>
+        </div>
+
+        <div style={S.psSection}>
+          <div style={S.pfFormHead}>Name & colour</div>
+          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={30} style={S.input} aria-label="Name" />
+          <ThemePicker value={theme} onChange={setTheme} />
+          {dirty && (
+            <div style={S.addActions}>
+              <button type="button" disabled={busy} style={{ ...S.saveBtn, background: c }}
+                onClick={() => run(() => onSave({ name: name.trim(), theme }), "Saved.")}>Save</button>
+            </div>
+          )}
+        </div>
+
+        <div style={S.psSection}>
+          <div style={S.pfFormHead}>PIN</div>
+          <div style={S.pfHint}>
+            {profile.hasPin
+              ? `On. ${profile.name}'s deck asks for it on every device except ${isOwnDevice ? "this one" : "their own"}.`
+              : `Off. Anyone with the household passcode can open ${profile.name}'s deck.`}
+          </div>
+          {pinEdit === null ? (
+            <div style={S.psBtns}>
+              <button type="button" disabled={busy} style={S.cancelBtn} onClick={() => { setPinEdit(""); setErr(""); }}>
+                {profile.hasPin ? "Change PIN" : "Set a PIN"}
+              </button>
+              {profile.hasPin && (
+                <button type="button" disabled={busy} style={S.deleteBtn} onClick={() => run(() => onSetPin(""), "PIN removed.")}>Remove PIN</button>
+              )}
+            </div>
+          ) : (
+            <form style={S.psBtns} onSubmit={(e) => { e.preventDefault(); if (pinOk) run(async () => { await onSetPin(pinEdit); setPinEdit(null); }, "PIN saved. Other devices signed in as " + profile.name + " must sign in again."); }}>
+              <input type="password" inputMode="numeric" autoComplete="off" autoFocus maxLength={6} value={pinEdit}
+                onChange={(e) => setPinEdit(e.target.value.replace(/\D/g, ""))}
+                placeholder="New PIN (4–6 digits)" style={{ ...S.input, flex: "1 1 160px" }} aria-label="New PIN" />
+              <button type="submit" disabled={busy || !pinOk} style={{ ...S.saveBtn, background: c, opacity: busy || !pinOk ? 0.6 : 1 }}>Save</button>
+              <button type="button" style={S.cancelBtn} onClick={() => setPinEdit(null)}>Cancel</button>
+            </form>
+          )}
+        </div>
+
+        <div style={S.psSection}>
+          <div style={S.pfFormHead}>Devices</div>
+          <div style={S.pfHint}>
+            {armed === "signout"
+              ? `Every other phone or tablet signed in as ${profile.name} will be sent back to the sign-in screen. This device stays in.`
+              : `Someone else got into ${profile.name}'s deck? Sign out the other devices, and set or change the PIN.`}
+          </div>
+          <div style={S.psBtns}>
+            <button type="button" disabled={busy} style={{ ...S.cancelBtn, ...(armed === "signout" ? S.psArmed : {}) }}
+              onClick={() => (armed === "signout" ? run(onSignOutOthers, "Other devices signed out.") : setArmed("signout"))}>
+              {armed === "signout" ? "Confirm sign-out" : "Sign out other devices"}
+            </button>
+          </div>
+        </div>
+
+        {canRemove && (
+          <div style={{ ...S.psSection, borderBottom: "none" }}>
+            <div style={S.pfFormHead}>Remove profile</div>
+            <div style={S.pfHint}>
+              {armed === "remove" ? `Deletes ${profile.name}'s private events and to-dos for good. Shared events stay.` : `Removes ${profile.name} and their private data.`}
+            </div>
+            <div style={S.psBtns}>
+              <button type="button" disabled={busy} style={{ ...S.deleteBtn, ...(armed === "remove" ? S.pfConfirm : {}) }}
+                onClick={() => (armed === "remove" ? run(onRemove) : setArmed("remove"))}>
+                {armed === "remove" ? `Yes, remove ${profile.name}` : "Remove profile"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {err && <div style={S.loginErr}>{err}</div>}
+        {note && <div style={S.psNote}>{note}</div>}
+      </div>
+    </div>
   );
 }
 
@@ -1382,7 +2751,7 @@ function ScopePopup({ mode, task, onThis, onFollowing, onAll, onClose }) {
   );
 }
 
-function EditModal({ task, onSave, onDelete, onClose }) {
+function EditModal({ task, onSave, onDelete, onClose, places, onAddPlace, home, onSaveHome }) {
   const [title, setTitle] = useState(task.title || "");
   const [start, setStart] = useState(task.start || "");
   const [end, setEnd] = useState(task.end || "");
@@ -1391,6 +2760,7 @@ function EditModal({ task, onSave, onDelete, onClose }) {
   const [tss, setTss] = useState(task.tss ? String(task.tss) : "");
   const [shared, setShared] = useState(!!task.shared);
   const [important, setImportant] = useState(!!task.important);
+  const [location, setLocation] = useState(task.location || "");
 
   useEffect(() => {
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
@@ -1400,7 +2770,7 @@ function EditModal({ task, onSave, onDelete, onClose }) {
 
   const save = () => {
     if (!title.trim()) return;
-    const fields = { title: title.trim(), start, end, cat, note: note.trim(), sport: task.sport || "", shared, tss: cat === "training" && tss ? Number(tss) : null };
+    const fields = { title: title.trim(), start, end, cat, note: note.trim(), sport: task.sport || "", shared, tss: cat === "training" && tss ? Number(tss) : null, location };
     // Repeating series have no per-instance star; only stored one-off tasks do.
     if (!task.recurring) fields.important = important;
     onSave(fields);
@@ -1434,6 +2804,7 @@ function EditModal({ task, onSave, onDelete, onClose }) {
               </button>
             ))}
           </div>
+          <TravelFields location={location} setLocation={setLocation} places={places} onAddPlace={onAddPlace} home={home} onSaveHome={onSaveHome} />
           {!task.recurring && <StarToggle important={important} onToggle={() => setImportant((s) => !s)} />}
           <SharedToggle shared={shared} onToggle={() => setShared((s) => !s)} />
           <div style={S.editActions}>
@@ -1494,8 +2865,8 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar, onShare })
       {imminent.length > 0 && (
         <div style={S.imminentBox}>
           {imminent.map((m) => (
-            <div key={m.id} style={S.imminentRow}>
-              <span style={S.imminentWhen}>{m.date === todayStr ? "Today" : "Tomorrow"}</span>
+            <div key={m.id} style={S.imminentRow} className="cd-imminent-row">
+              <span style={S.imminentWhen}>{m.date === todayStr ? "Today" : "Tomorrow"}{m.start ? <span style={S.imminentTime}> {m.start}</span> : null}</span>
               <span style={{ ...S.monthDotEl, background: CATS[m.cat]?.dot || "#888" }} />
               <span style={S.imminentTitle}>{m.shared ? <span title="Shared on both decks">🔗 </span> : null}{m.title}</span>
               {isStored(m.id) && (
@@ -1506,14 +2877,14 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar, onShare })
         </div>
       )}
 
-      <div style={S.monthList}>
+      <div style={S.monthList} className="cd-month-list">
         {imminent.length === 0 && later.length === 0 && (
           <div style={S.empty}>Nothing in the next 30 days. Add something below.</div>
         )}
         {later.map((m) => {
           const d = new Date(m.date + "T00:00:00");
           return (
-            <div key={m.id} style={S.monthItem} className="cd-row">
+            <div key={m.id} style={S.monthItem} className="cd-row cd-month-item">
               <div style={S.monthDate}>
                 <span style={S.monthDay}>{d.getDate()}</span>
                 <span style={S.monthMon}>{MONTHS[d.getMonth()].slice(0,3)}</span>
@@ -1536,7 +2907,7 @@ function MonthList({ imminent, later, today, onAdd, onRemove, onStar, onShare })
         })}
       </div>
 
-      <div style={S.monthAdd}>
+      <div style={S.monthAdd} className="cd-month-add">
         <input type="date" value={date} onChange={(e)=>setDate(e.target.value)} style={{ ...S.input, flex:"0 0 auto" }} />
         <input type="time" value={start} onChange={(e)=>setStart(e.target.value)} style={{ ...S.input, flex:"0 0 auto" }} title="Start (optional)" />
         <input type="time" value={end} onChange={(e)=>setEnd(e.target.value)} style={{ ...S.input, flex:"0 0 auto" }} title="End (optional)" />
@@ -1584,58 +2955,180 @@ const globalCss = `
   @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Spline+Sans:wght@400;500;600&display=swap');
   * { box-sizing: border-box; }
   body { margin: 0; }
+  /* Accent vars typed as colors so they can interpolate; the shell transition
+     morphs the whole palette on profile switch. Browsers without @property
+     simply swap instantly (today's behavior) — graceful, no breakage. */
+  @property --accent { syntax: '<color>'; inherits: true; initial-value: #2f5d9e; }
+  @property --accent-soft { syntax: '<color>'; inherits: true; initial-value: #eef3fa; }
+  @property --accent-border { syntax: '<color>'; inherits: true; initial-value: #cdddef; }
+  @property --accent-dark { syntax: '<color>'; inherits: true; initial-value: #244b80; }
+  .cd-shell { transition: --accent .5s ease, --accent-soft .5s ease, --accent-border .5s ease, --accent-dark .5s ease; }
   .cd-card { transition: transform .25s ease, box-shadow .25s ease; }
-  .cd-card:hover { box-shadow: 0 18px 40px -24px rgba(30,40,70,0.45); }
   .cd-block { transition: transform .15s ease, opacity .2s ease; }
-  .cd-block:hover { transform: translateX(2px); }
   .cd-weekday { transition: transform .15s ease, background .2s ease; }
-  .cd-weekday:hover { transform: translateY(-3px); }
   .cd-del { opacity: 0; transition: opacity .2s ease; }
-  .cd-row:hover .cd-del { opacity: 1; }
-  .cd-add:hover { background: ${line}; }
   @keyframes rise { from { opacity:0; transform: translateY(10px);} to {opacity:1; transform:none;} }
   @keyframes ovFade { from { opacity:0; } to { opacity:1; } }
   @keyframes ovSlide { from { opacity:0; transform: translateY(24px) scale(.98); } to { opacity:1; transform:none; } }
-  .cd-workout { cursor: pointer; }
-  .cd-workout:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px var(--accent-glow); }
+  @keyframes swap { from { opacity:0; transform: translateY(7px); } to { opacity:1; transform:none; } }
+  .cd-swap { animation: swap .42s cubic-bezier(.2,.8,.25,1); }
+  .cd-workout { cursor: pointer; transition: transform .2s ease, box-shadow .25s ease; }
+
   .cd-ov-backdrop { animation: ovFade .2s ease; }
   .cd-ov-panel { animation: ovSlide .28s cubic-bezier(.2,.8,.25,1); }
-  .cd-ov-close:hover { background: ${line}; color: ${ink}; }
-  .cd-ov-box:hover { transform: translateY(-2px); border-color: var(--accent-border); box-shadow: 0 12px 26px -18px var(--accent-glow); }
+
   @keyframes badgePulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
   .cd-badge-live { animation: badgePulse 2.4s ease-in-out infinite; }
-  .cd-push:hover { background: var(--accent-border); }
-  .cd-cal-cell:hover { border-color: var(--accent); }
+
+  @keyframes ptrSpin { to { transform: rotate(360deg); } }
+  .cd-ptr-spin { animation: ptrSpin .7s linear infinite; }
   @keyframes toastUp { from { opacity:0; transform: translate(-50%, 16px); } to { opacity:1; transform: translate(-50%, 0); } }
   .cd-toast { animation: toastUp .25s cubic-bezier(.2,.8,.25,1); }
-  .cd-toast-undo:hover { background: rgba(255,255,255,0.16); }
+  /* Hover effects only for real mouse pointers. On touch screens a tap leaves
+     :hover "stuck" on the last thing touched, which looked like a highlight
+     that never went away. */
+  @media (hover: hover) and (pointer: fine) {
+    .cd-card:hover { box-shadow: 0 18px 40px -24px rgba(30,40,70,0.45); }
+    .cd-block:hover { transform: translateX(2px); }
+    .cd-weekday:hover { transform: translateY(-3px); }
+    .cd-row:hover .cd-del { opacity: 1; }
+    .cd-add:hover { background: ${line}; }
+    .cd-workout:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px var(--accent-glow); }
+    .cd-ov-close:hover { background: ${line}; color: ${ink}; }
+    .cd-ov-box:hover { transform: translateY(-2px); border-color: var(--accent-border); box-shadow: 0 12px 26px -18px var(--accent-glow); }
+    .cd-push:hover { background: var(--accent-border); }
+    .cd-cal-cell:hover { border-color: var(--accent); }
+    .cd-toast-undo:hover { background: rgba(255,255,255,0.16); }
+  }
+  /* Touch: no hover to reveal delete buttons, so show them; brief press feedback instead. */
+  @media (hover: none) {
+    .cd-del { opacity: 1; }
+    .cd-weekday:active, .cd-push:active, .cd-workout:active { transform: scale(0.97); }
+  }
+  button, [role="button"], input, select, label { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+  :focus:not(:focus-visible) { outline: none; }
+  .cd-nosel { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  /* Room for the iPhone notch/status bar when running from the home screen. */
+  .cd-shell { padding-top: calc(env(safe-area-inset-top, 0px) + 28px) !important; }
+  .cd-header-main { min-width: 0; text-align: left; }
+
+  /* --- Tablet portrait & phones: one column, bottom-sheet dialogs --- */
+  @keyframes sheetUp { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @media (max-width: 900px) {
+    .cd-shell { padding: calc(env(safe-area-inset-top, 0px) + 16px) max(14px, env(safe-area-inset-right, 0px))
+                         calc(env(safe-area-inset-bottom, 0px) + 28px) max(14px, env(safe-area-inset-left, 0px)) !important; }
+    .cd-grid { grid-template-columns: minmax(0, 1fr) !important; gap: 14px !important; margin-bottom: 14px !important; }
+    .cd-week-card { margin-bottom: 14px !important; }
+    .cd-month-list { max-height: none !important; }
+    .cd-month-add > input, .cd-month-add > select { flex: 1 1 calc(50% - 8px) !important; min-width: 0; }
+    .cd-ov-backdrop { align-items: flex-end !important; padding: 0 !important; }
+    .cd-ov-panel { max-width: none !important; width: 100% !important; margin: 0 !important; max-height: 92vh; max-height: 92dvh;
+                   overflow-y: auto; border-radius: 22px 22px 0 0 !important; border-bottom: none !important;
+                   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 22px) !important;
+                   animation: sheetUp .28s cubic-bezier(.2,.8,.25,1) !important; }
+    .cd-toast { bottom: calc(env(safe-area-inset-bottom, 0px) + 16px) !important; }
+    /* iOS zooms the page when focusing any input under 16px. */
+    input, select, textarea { font-size: 16px !important; }
+  }
+  @media (max-width: 600px) {
+    .cd-header { align-items: flex-start !important; margin-bottom: 16px !important; gap: 10px; }
+    .cd-header-main { flex: 1 1 auto; }
+    .cd-profile-bar { overflow-x: auto; scrollbar-width: none; padding: 2px 0 4px; }
+    .cd-profile-bar::-webkit-scrollbar { display: none; }
+    .cd-profile-bar > button { flex: 0 0 auto; padding: 8px 14px !important; font-size: 13.5px !important; }
+    .cd-big-day { font-size: 30px !important; }
+    .cd-card { padding: 16px 14px !important; border-radius: 18px !important; }
+    .cd-week-row { gap: 4px !important; }
+    .cd-week-row > button { padding: 9px 0 8px !important; border-radius: 12px !important; min-width: 0; }
+    .cd-week-name { font-size: 10px !important; letter-spacing: 0 !important; }
+    .cd-week-num { font-size: 18px !important; margin: 2px 0 6px !important; }
+    .cd-wx-row { gap: 2px !important; }
+    .cd-tl-row { grid-template-columns: 40px 34px minmax(0, 1fr) 30px !important; gap: 6px !important; }
+    .cd-month-item { grid-template-columns: 36px 36px 8px minmax(0, 1fr) 26px 26px 26px !important; gap: 8px !important; }
+    .cd-imminent-row { gap: 8px !important; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cd-swap, .cd-toast, .cd-ov-panel, .cd-ov-backdrop, .cd-badge-live { animation: none; }
+    .cd-shell { transition: none; }
+  }
 `;
 
+// Styles that another style toggles by `borderColor`/`borderStyle` (active,
+// selected, armed…) also spell those longhands out next to `border`. React
+// *removes* a longhand when the toggle turns off, which resets the colour to
+// currentColor (black) instead of the shorthand's grey: the "outline that
+// never goes away" on previously tapped days/pills.
 const S = {
   shell: { minHeight: "100vh", background: "var(--app-bg)",
            fontFamily: "'Spline Sans', sans-serif", color: ink, padding: "28px clamp(16px,4vw,48px) 48px", animation: "rise .5s ease" },
   loading: { fontFamily: "'Fraunces', serif", fontSize: 22, color: muted, padding: 60, textAlign: "center" },
+  ptr: { position: "fixed", top: "env(safe-area-inset-top, 0px)", left: "50%", zIndex: 300,
+    width: 40, height: 40, borderRadius: "50%", background: cardBg, border: `1px solid ${line}`,
+    boxShadow: "0 10px 24px -12px rgba(20,30,60,0.5)", display: "flex", alignItems: "center", justifyContent: "center",
+    pointerEvents: "none" },
+  ptrIcon: { fontSize: 20, fontWeight: 700, lineHeight: 1, display: "inline-block", transition: "color .15s ease" },
+  updateBar: { display: "block", width: "100%", maxWidth: 1200, margin: "0 auto 14px", padding: "10px 14px", borderRadius: 12,
+    border: `1px solid ${accentBorder}`, background: accentSoft, color: accent, fontSize: 13.5, fontWeight: 600,
+    fontFamily: "inherit", cursor: "pointer", textAlign: "center" },
   errorBanner: { maxWidth: 1200, margin: "0 auto 14px", padding: "8px 14px", borderRadius: 10,
                  background: "#fbeae3", color: "#7a3a1f", fontSize: 12.5, border: "1px solid #f0d4c4" },
   header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 26, maxWidth: 1200, marginInline: "auto" },
   kicker: { textTransform: "uppercase", letterSpacing: "0.22em", fontSize: 11, color: muted, fontWeight: 600 },
   profileBar: { display: "flex", gap: 6, marginBottom: 8 },
-  profilePill: { padding: "5px 14px", borderRadius: 999, border: `1px solid ${line}`, background: cardBg, color: muted,
-    fontSize: 12.5, fontWeight: 600, letterSpacing: "0.02em", cursor: "pointer", fontFamily: "inherit", transition: "all .18s ease" },
+  profilePill: { padding: "5px 14px", borderRadius: 999, border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, background: cardBg, color: muted,
+    fontSize: 12.5, fontWeight: 600, letterSpacing: "0.02em", cursor: "pointer", fontFamily: "inherit", transition: "all .28s ease" },
+  profileManage: { padding: "5px 11px", borderRadius: 999, border: `1px dashed ${line}`, background: "transparent", color: muted,
+    fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", transition: "all .28s ease" },
+  pfList: { display: "flex", flexDirection: "column", gap: 2, marginBottom: 6 },
+  pfRowBtn: { display: "grid", gridTemplateColumns: "14px 1fr auto", gap: 12, alignItems: "center", width: "100%", textAlign: "left",
+    padding: "12px 6px", border: "none", borderBottom: `1px solid ${line}`, background: "transparent", cursor: "pointer",
+    fontFamily: "inherit", borderRadius: 0 },
+  pfChevron: { fontSize: 22, color: faint, lineHeight: 1 },
+  pfTip: { fontSize: 12, color: faint, margin: "10px 2px 14px" },
+  psSection: { display: "flex", flexDirection: "column", gap: 9, padding: "4px 0 16px", marginBottom: 14, borderBottom: `1px solid ${line}` },
+  psBtns: { display: "flex", flexWrap: "wrap", gap: 8 },
+  psArmed: { background: accent, color: "#fff", borderColor: accent },
+  psNote: { fontSize: 13, color: "#3f7a45", fontWeight: 600 },
+  imminentTime: { fontFamily: "'Spline Sans', sans-serif", fontSize: 12, fontWeight: 600, color: muted, marginLeft: 4 },
+  pillLock: { marginLeft: 5, fontSize: 10 },
+  pinInput: { fontSize: 22, letterSpacing: "0.4em", textAlign: "center" },
+  pinClaim: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: muted, margin: "12px 0 14px", cursor: "pointer" },
+  sideCol: { display: "flex", flexDirection: "column", gap: 18, minWidth: 0 },
+  todoClear: { border: "none", background: "transparent", color: accent, fontSize: 12.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", padding: 0 },
+  todoList: { display: "flex", flexDirection: "column" },
+  todoRow: { display: "grid", gridTemplateColumns: "24px 1fr auto", gap: 10, alignItems: "center", padding: "7px 0", borderBottom: `1px solid ${line}` },
+  todoBox: { width: 22, height: 22, borderRadius: 7, border: `1.5px solid ${accentBorder}`, borderStyle: "solid", borderColor: accentBorder, background: "#fff", color: "#fff",
+    fontSize: 13, fontWeight: 700, lineHeight: 1, cursor: "pointer", padding: 0, display: "flex", alignItems: "center", justifyContent: "center" },
+  todoBoxOn: { background: accent, borderColor: accent },
+  todoTitle: { fontSize: 14, color: ink, cursor: "pointer", overflowWrap: "anywhere", textAlign: "left" },
+  todoTitleDone: { color: faint, textDecoration: "line-through" },
+  todoDel: { border: "none", background: "transparent", color: faint, fontSize: 18, lineHeight: 1, cursor: "pointer", padding: "0 4px" },
+  todoAdd: { display: "flex", gap: 8, marginTop: 12 },
+  pfSwatch: { width: 14, height: 14, borderRadius: "50%" },
+  pfName: { display: "block", fontSize: 15, fontWeight: 600, color: ink },
+  pfYou: { fontSize: 12, fontWeight: 500, color: faint },
+  pfMeta: { display: "block", fontSize: 12, color: muted, marginTop: 1 },
+  pfConfirm: { background: "#b5483f", color: "#fff", borderColor: "#b5483f" },
+  pfFormHead: { fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.09em", color: muted },
+  pfThemes: { display: "flex", gap: 10, flexWrap: "wrap", padding: "4px 2px" },
+  pfTheme: { width: 28, height: 28, borderRadius: "50%", border: "none", cursor: "pointer", transition: "box-shadow .15s ease" },
+  pfCalToggle: { alignSelf: "flex-start", border: "none", background: "transparent", color: muted, fontSize: 13, fontWeight: 600,
+    cursor: "pointer", fontFamily: "inherit", padding: "2px 0" },
+  pfHint: { fontSize: 12, color: muted, lineHeight: 1.45 },
   loginCard: { width: "100%", maxWidth: 360, background: cardBg, border: `1px solid ${line}`, borderRadius: 22,
     padding: "28px 26px", display: "flex", flexDirection: "column", gap: 12, boxShadow: "0 30px 60px -30px rgba(30,40,70,0.45)" },
   loginKicker: { fontSize: 12, fontWeight: 700, letterSpacing: "0.14em", textTransform: "uppercase", color: accent },
   loginTitle: { fontFamily: "'Fraunces', serif", fontSize: 26, fontWeight: 600, color: ink, margin: 0 },
   loginSub: { fontSize: 13.5, color: muted, margin: "0 0 4px", lineHeight: 1.5 },
-  loginPills: { display: "flex", gap: 10 },
-  loginPill: { flex: 1, padding: "10px 0", borderRadius: 12, border: `1px solid ${line}`, background: cardBg, color: muted,
+  loginPills: { display: "flex", flexWrap: "wrap", gap: 10 },
+  loginPill: { flex: "1 1 30%", padding: "10px 8px", borderRadius: 12, border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, background: cardBg, color: muted,
     fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", transition: "all .18s ease" },
   loginInputErr: { borderColor: "#e0a3a3" },
   loginErr: { fontSize: 12.5, color: "#b5483f", fontWeight: 600 },
   loginBtn: { marginTop: 4, padding: "12px", borderRadius: 12, border: "none", background: accent, color: "#fff",
     fontSize: 15, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   shareToggle: { display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "9px 12px", borderRadius: 12,
-    border: `1px dashed ${line}`, background: "transparent", color: muted, fontSize: 13, fontWeight: 600,
+    border: `1px dashed ${line}`, borderStyle: "dashed", borderColor: line, background: "transparent", color: muted, fontSize: 13, fontWeight: 600,
     fontFamily: "inherit", cursor: "pointer", transition: "all .18s ease" },
   shareToggleOn: { borderStyle: "solid", borderColor: accentBorder, background: accentSoft, color: accent },
   starToggleOn: { borderStyle: "solid", borderColor: "#e6c98a", background: "rgba(212,160,86,0.14)", color: "#a8761c" },
@@ -1670,7 +3163,7 @@ const S = {
   tlBadge: { position: "relative", zIndex: 1, width: 34, height: 34, borderRadius: "50%", display: "flex",
              alignItems: "center", justifyContent: "center", flex: "0 0 auto", background: "#fff" },
   tlBadgeGlyph: { fontSize: 16, lineHeight: 1 },
-  tlBlock: { position: "relative", overflow: "hidden", textAlign: "left", border: `1px solid ${line}`, background: "#fff",
+  tlBlock: { position: "relative", overflow: "hidden", textAlign: "left", border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, background: "#fff",
              borderRadius: 16, padding: 0, margin: "4px 0", cursor: "pointer", display: "block", width: "100%" },
   tlBlockActive: { border: `1.5px solid ${accent}`, boxShadow: "0 10px 24px -16px rgba(47,93,158,0.65)" },
   tlBlockInner: { position: "relative", zIndex: 1, padding: "11px 14px" },
@@ -1689,6 +3182,27 @@ const S = {
   tlGapRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 38px", gap: 8, alignItems: "stretch", minHeight: 30 },
   tlGap: { display: "flex", alignItems: "center", gap: 8, padding: "4px 2px", fontSize: 12.5, color: faint, fontStyle: "italic" },
   tlGapIcon: { fontSize: 13, opacity: 0.75, fontStyle: "normal" },
+
+  // Travel estimate row (non-completable) + the from/to picker in the forms.
+  tlTravelRow: { display: "grid", gridTemplateColumns: "50px 40px 1fr 38px", gap: 8, alignItems: "center", minHeight: 30 },
+  tlTravelBadge: { position: "relative", zIndex: 1, width: 22, height: 22, borderRadius: "50%", display: "flex",
+                   alignItems: "center", justifyContent: "center", fontSize: 11, background: cardBg,
+                   border: `1px dashed ${line}`, boxShadow: `0 0 0 3px ${cardBg}` },
+  tlTravelBlock: { display: "flex", flexDirection: "column", gap: 1, padding: "3px 2px" },
+  tlTravelMain: { fontSize: 13, fontWeight: 600, color: accent },
+  tlTravelSub: { fontSize: 12, color: muted },
+  tlTravelMuted: { fontSize: 12.5, color: faint, fontStyle: "italic" },
+
+  travelBox: { display: "flex", flexDirection: "column", gap: 8, padding: "10px 11px", borderRadius: 12,
+               background: "#fff", border: `1px solid ${line}` },
+  travelHead: { fontSize: 12.5, fontWeight: 700, color: ink },
+  travelHint: { fontWeight: 500, color: faint },
+  travelField: { display: "flex", alignItems: "center", gap: 8 },
+  travelLabel: { fontSize: 12.5, color: muted, width: 42, flex: "0 0 auto" },
+  placeAdd: { display: "flex", flexDirection: "column", gap: 7, padding: "8px 0" },
+  placeErr: { fontSize: 12, color: "#c0405a" },
+  homeLine: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 12, color: muted },
+  homeEdit: { border: "none", background: "transparent", color: accent, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", fontSize: 12, padding: 0 },
   tlGapNow: { color: accent, fontWeight: 600, fontStyle: "normal" },
   tlEmpty: { fontSize: 13.5, color: muted, fontStyle: "italic", padding: "16px 2px", lineHeight: 1.5 },
   tlActions: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2 },
@@ -1704,15 +3218,15 @@ const S = {
             background: "transparent", color: muted, fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   addPanel: { marginTop: 14, padding: 14, borderRadius: 14, background: paper, display: "flex", flexDirection: "column", gap: 9 },
   addGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 9 },
-  input: { padding: "9px 11px", borderRadius: 10, border: `1px solid ${line}`, fontSize: 14, fontFamily: "inherit", background: "#fff", color: ink, width: "100%" },
+  input: { padding: "9px 11px", borderRadius: 10, border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, fontSize: 14, fontFamily: "inherit", background: "#fff", color: ink, width: "100%" },
   catPick: { display: "flex", gap: 7, flexWrap: "wrap" },
   catChip: { padding: "6px 12px", borderRadius: 20, border: "1.5px solid", fontSize: 12.5, fontWeight: 600, cursor: "pointer", background: "transparent", fontFamily: "inherit" },
   addActions: { display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 2 },
   editActions: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 2 },
-  deleteBtn: { padding: "8px 14px", borderRadius: 10, border: "1px solid #e6c3c3", background: "#fff", color: "#b5483f", fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
-  cancelBtn: { padding: "8px 16px", borderRadius: 10, border: `1px solid ${line}`, background: "#fff", color: muted, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
+  deleteBtn: { padding: "8px 14px", borderRadius: 10, border: "1px solid #e6c3c3", borderStyle: "solid", borderColor: "#e6c3c3", background: "#fff", color: "#b5483f", fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
+  cancelBtn: { padding: "8px 16px", borderRadius: 10, border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, background: "#fff", color: muted, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   saveBtn: { padding: "8px 18px", borderRadius: 10, border: "none", background: accent, color: "#fff", fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
-  workoutCard: { background: "var(--accent-grad)", border: "none", color: "#fff" },
+  workoutCard: { background: "linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%)", border: "none", color: "#fff" },
   woTitle: { fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 600, lineHeight: 1.2 },
   woMeta: { fontSize: 13.5, opacity: 0.85, marginTop: 6, fontWeight: 500 },
   woNote: { fontSize: 13, opacity: 0.92, marginTop: 10, lineHeight: 1.45, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.22)" },
@@ -1724,7 +3238,7 @@ const S = {
   repeatInline: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
   repeatWord: { fontSize: 13, color: muted },
   wdPick: { display: "flex", gap: 5, flexWrap: "wrap" },
-  wdChip: { width: 30, height: 30, borderRadius: "50%", border: `1.5px solid ${line}`, background: "transparent",
+  wdChip: { width: 30, height: 30, borderRadius: "50%", border: `1.5px solid ${line}`, borderStyle: "solid", borderColor: line, background: "transparent",
             color: muted, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
   wdChipOn: { borderColor: accent, background: accentSoft, color: accent },
 
@@ -1736,7 +3250,7 @@ const S = {
   scopeTitle: { fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20, margin: "0 0 6px", color: ink },
   scopeText: { fontSize: 13.5, color: muted, margin: "0 0 16px", lineHeight: 1.45 },
   scopeBtn: { display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, width: "100%", textAlign: "left",
-              border: `1px solid ${line}`, background: "#fff", borderRadius: 12, padding: "11px 14px", marginBottom: 9,
+              border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, background: "#fff", borderRadius: 12, padding: "11px 14px", marginBottom: 9,
               fontSize: 14.5, fontWeight: 600, color: ink, cursor: "pointer", fontFamily: "inherit" },
   scopeBtnDanger: { borderColor: "#e6b0b0", color: "#b5402f" },
   scopeSub: { fontSize: 11.5, fontWeight: 400, color: muted },
@@ -1793,6 +3307,46 @@ const S = {
   ovActMeta: { fontSize: 11.5, color: muted, fontVariantNumeric: "tabular-nums", textAlign: "right" },
   ovFootHint: { fontSize: 12, color: faint, fontStyle: "italic", textAlign: "center", marginTop: 4 },
 
+  // coach prompt generator
+  coachBtn: { width: "100%", textAlign: "left", border: `1px solid ${accentBorder}`, background: accentSoft, borderRadius: 16,
+              padding: "13px 16px", fontFamily: "inherit", fontSize: 14.5, fontWeight: 700, color: accent, cursor: "pointer",
+              display: "flex", flexDirection: "column", gap: 3, transition: "transform .15s ease, box-shadow .2s ease, border-color .2s ease" },
+  coachBtnSub: { fontSize: 12, fontWeight: 500, color: muted },
+  coachForm: { display: "flex", flexDirection: "column", gap: 14 },
+  coachDates: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+  coachField: { display: "flex", flexDirection: "column", gap: 5 },
+  coachLabel: { fontSize: 11.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: muted },
+  coachNotes: { width: "100%", border: `1px solid ${line}`, borderRadius: 12, padding: "10px 12px", fontFamily: "inherit",
+                fontSize: 14, color: ink, resize: "vertical", boxSizing: "border-box", background: "#fff" },
+  coachActions: { display: "flex", alignItems: "center", gap: 12 },
+  coachCopy: { border: `1px solid ${accent}`, background: accent, color: "#fff", borderRadius: 12, padding: "9px 18px",
+               fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", flex: "0 0 auto" },
+  coachHint: { fontSize: 12, color: faint },
+  coachOut: { width: "100%", minHeight: 300, border: `1px solid ${line}`, borderRadius: 12, padding: "12px 13px",
+              fontFamily: "ui-monospace, 'SF Mono', Menlo, Consolas, monospace", fontSize: 11.5, lineHeight: 1.5,
+              color: ink, background: paper, resize: "vertical", boxSizing: "border-box", whiteSpace: "pre", overflowWrap: "normal" },
+
+  // plan import (stage 2)
+  coachTabs: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 },
+  coachTab: { border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, background: "#fff", borderRadius: 12, padding: "9px 10px", fontFamily: "inherit",
+              fontSize: 13, fontWeight: 700, color: muted, cursor: "pointer", transition: "background .15s ease, color .15s ease, border-color .15s ease" },
+  coachTabOn: { background: accentSoft, borderColor: accentBorder, color: accent },
+  fileBtn: { display: "inline-flex", alignItems: "center", border: `1px solid ${line}`, background: "#fff", borderRadius: 12,
+             padding: "9px 16px", fontSize: 13.5, fontWeight: 600, color: ink, cursor: "pointer", fontFamily: "inherit", flex: "0 0 auto" },
+  importIntro: { fontSize: 13, color: muted, margin: 0, lineHeight: 1.45 },
+  importErr: { fontSize: 13, color: "#7a3a1f", background: "#fbeae3", border: "1px solid #f0d4c4", borderRadius: 10, padding: "9px 12px" },
+  importDone: { fontSize: 13, fontWeight: 600, color: "#2f6d3a", background: "#e6f3e8", border: "1px solid #c4e0c9", borderRadius: 10, padding: "9px 12px" },
+  importPreview: { border: `1px solid ${line}`, borderRadius: 12, background: paper, padding: "10px 12px",
+                   display: "flex", flexDirection: "column", gap: 9, maxHeight: 300, overflowY: "auto" },
+  importPreviewHead: { fontSize: 11.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: muted },
+  previewGroup: { display: "flex", flexDirection: "column", gap: 3 },
+  previewDay: { fontSize: 12, fontWeight: 700, color: accent },
+  previewRow: { display: "grid", gridTemplateColumns: "94px 1fr auto", gap: 8, alignItems: "baseline", fontSize: 13 },
+  previewTime: { fontSize: 12, color: muted, fontVariantNumeric: "tabular-nums" },
+  previewTitle: { color: ink, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  previewMeta: { fontSize: 11.5, color: faint, fontVariantNumeric: "tabular-nums", textAlign: "right" },
+  replaceRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: ink, cursor: "pointer" },
+
   // compact 7-day plan
   ovPlan: { display: "flex", flexDirection: "column", gap: 1 },
   ovPlanEmpty: { fontSize: 13, color: muted, fontStyle: "italic", background: paper, borderRadius: 12, padding: "12px 14px", lineHeight: 1.4 },
@@ -1824,7 +3378,7 @@ const S = {
   calWeekHead: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 5, marginBottom: 6 },
   calWeekName: { fontSize: 11, color: muted, fontWeight: 600, textAlign: "center", textTransform: "uppercase", letterSpacing: "0.04em" },
   calGrid: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 5 },
-  calCell: { minHeight: 58, border: `1px solid ${line}`, borderRadius: 12, background: "#fff", padding: "6px 3px 5px",
+  calCell: { minHeight: 58, border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, borderRadius: 12, background: "#fff", padding: "6px 3px 5px",
              display: "flex", flexDirection: "column", alignItems: "center", gap: 5, cursor: "pointer", fontFamily: "inherit",
              transition: "border-color .15s ease, background .15s ease" },
   calCellOut: { background: paper, opacity: 0.5 },
@@ -1852,7 +3406,7 @@ const S = {
   ovZonePct: { fontSize: 12, color: muted, fontVariantNumeric: "tabular-nums", textAlign: "right" },
   ovZoneMain: { fontSize: 13, fontWeight: 600, color: ink, fontVariantNumeric: "tabular-nums", minWidth: 86, textAlign: "right" },
   wxRow: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 },
-  wxDay: { textAlign: "center", padding: "6px 2px", borderRadius: 10, border: "1px solid transparent",
+  wxDay: { textAlign: "center", padding: "6px 2px", borderRadius: 10, border: "1px solid transparent", borderStyle: "solid", borderColor: "transparent",
            background: "transparent", cursor: "pointer", fontFamily: "inherit" },
   wxDayActive: { background: accentSoft, borderColor: accent },
   wxDetail: { marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}` },
@@ -1872,7 +3426,7 @@ const S = {
   wxPop: { fontSize: 10.5, color: accent, marginTop: 2, fontWeight: 600 },
   wxNote: { fontSize: 12, color: muted, marginTop: 12, lineHeight: 1.45, fontStyle: "italic" },
   weekRow: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 8 },
-  weekDay: { border: `1px solid ${line}`, borderRadius: 16, padding: "12px 6px 10px", background: "#fff", cursor: "pointer", textAlign: "center", fontFamily: "inherit" },
+  weekDay: { border: `1px solid ${line}`, borderStyle: "solid", borderColor: line, borderRadius: 16, padding: "12px 6px 10px", background: "#fff", cursor: "pointer", textAlign: "center", fontFamily: "inherit" },
   weekDayActive: { background: accentSoft, borderColor: accent, boxShadow: "0 8px 22px -16px rgba(47,93,158,0.7)" },
   weekName: { fontSize: 11.5, color: muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" },
   weekNum: { fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 600, margin: "3px 0 7px", color: ink },
@@ -1881,9 +3435,9 @@ const S = {
   weekDot: { width: 7, height: 7, borderRadius: "50%" },
   weekCount: { fontSize: 11, color: muted, marginTop: 8, fontVariantNumeric: "tabular-nums" },
   imminentBox: { background: accentSoft, border: `1px solid ${accentBorder}`, borderRadius: 14, padding: "10px 14px", marginBottom: 14, display: "flex", flexDirection: "column", gap: 6 },
-  imminentRow: { display: "grid", gridTemplateColumns: "82px 10px 1fr 24px", gap: 12, alignItems: "center" },
+  imminentRow: { display: "grid", gridTemplateColumns: "minmax(82px, auto) 10px 1fr 24px", gap: 12, alignItems: "center" },
   imminentWhen: { fontFamily: "'Fraunces', serif", fontSize: 14, fontWeight: 700, color: accent, letterSpacing: "0.02em" },
-  imminentTitle: { fontSize: 14.5, fontWeight: 600, color: ink },
+  imminentTitle: { fontSize: 14.5, fontWeight: 600, color: ink, textAlign: "left", minWidth: 0 },
   monthList: { display: "flex", flexDirection: "column", gap: 2, marginBottom: 14, maxHeight: 260, overflowY: "auto" },
   monthItem: { display: "grid", gridTemplateColumns: "44px 42px 10px 1fr 20px 20px 24px", gap: 12, alignItems: "center", padding: "9px 4px", borderBottom: `1px solid ${line}` },
   monthTimeCell: { fontSize: 12.5, color: muted, fontWeight: 500, fontVariantNumeric: "tabular-nums", textAlign: "right" },
@@ -1900,7 +3454,7 @@ const S = {
   monthDay: { fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 700, display: "block", lineHeight: 1, color: accent },
   monthMon: { fontSize: 10.5, color: muted, textTransform: "uppercase", letterSpacing: "0.05em" },
   monthDotEl: { width: 10, height: 10, borderRadius: "50%" },
-  monthTitle: { fontSize: 14.5, fontWeight: 500 },
+  monthTitle: { fontSize: 14.5, fontWeight: 500, textAlign: "left", minWidth: 0 },
   monthAdd: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" },
   footer: { textAlign: "center", fontSize: 12, color: muted, marginTop: 26, maxWidth: 1200, marginInline: "auto" },
 };

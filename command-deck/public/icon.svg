@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Command Deck app icon: a planner card on the denim accent. Full-bleed so
+       iOS/Android can round or mask the corners themselves. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a6db3"/>
+      <stop offset="1" stop-color="#244b80"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <rect x="120" y="120" width="272" height="272" rx="40" fill="#fbfcfe"/>
+  <rect x="120" y="120" width="272" height="64" rx="40" fill="#dce6f4"/>
+  <rect x="120" y="152" width="272" height="32" fill="#dce6f4"/>
+  <circle cx="170" cy="232" r="14" fill="#2f5d9e"/>
+  <rect x="198" y="222" width="150" height="20" rx="10" fill="#cdd6e4"/>
+  <circle cx="170" cy="286" r="14" fill="#6f9e6a"/>
+  <rect x="198" y="276" width="120" height="20" rx="10" fill="#cdd6e4"/>
+  <circle cx="170" cy="340" r="14" fill="#d4a056"/>
+  <rect x="198" y="330" width="136" height="20" rx="10" fill="#cdd6e4"/>
+</svg>

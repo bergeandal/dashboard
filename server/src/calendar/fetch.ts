@@ -1,4 +1,4 @@
-import { config, type Category } from "../config.js";
+import type { Category } from "../config.js";
 import { fetchCalendarAsTasks, fetchCalendarFromFile, type Task } from "./toTasks.js";
 
 const CACHE_MS = 5 * 60 * 1000;
@@ -40,8 +40,8 @@ export async function fetchAllTasks(calendars: CalMap, windowStart: Date, window
   return results.flat().sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
 }
 
-export async function fetchBirthdays(windowStart: Date, windowEnd: Date): Promise<Task[]> {
-  const src: Source = { cat: "birthday", kind: "file", value: config.birthdaysFile };
+export async function fetchBirthdays(file: string, windowStart: Date, windowEnd: Date): Promise<Task[]> {
+  const src: Source = { cat: "birthday", kind: "file", value: file };
   if (!src.value) return [];
   // Roll window back 1 day so today's birthday is included regardless of TZ offset.
   const inclusiveStart = new Date(+windowStart - 24 * 3600 * 1000);
